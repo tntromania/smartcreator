@@ -55,8 +55,10 @@ app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 // (opțional) servește static (dacă pui index.html în /public)
 // import.meta.url este ESM; dacă nu vrei static, comentează 2 linii de mai jos
-app.use(express.static(path.join(__dirname, "public")));
-app.get("/", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+// — înlocuiește cele două rute statice —
+app.use(express.static(__dirname));
+app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "index.html")));
+
 
 // --- API REST ---
 app.get("/api/history", async (_req, res) => {
