@@ -1,5 +1,6 @@
 // server.js
 // Chat + Voice WebRTC signaling + Typing + History (SQLite) — all-in-one
+// + servește index.html DIRECT din memorie (fără fișier pe disc)
 
 import express from "express";
 import http from "http";
@@ -7,18 +8,21 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { WebSocketServer } from "ws";
 import crypto from "crypto";
-import path from "path";
-import { fileURLToPath } from "url";
 
 // === SQLite (persistență mesaje) ==========================
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
+// ------------ AICI ȚINEM HTML-UL ÎN MEMORIE ----------------
+// Lipeste TOT index.html-ul tău între backtick-uri (`...`).
+// Dacă ai resurse mari (BG.jpg, video), folosește URL-uri absolute (CDN / Supabase Storage / Drive).
+const INDEX_HTML = /* html */ `<!DOCTYPE html>
+<!-- PASTE INDEX.HTML AICI (TOT ce mi-ai dat) -->
+`;
+// -----------------------------------------------------------
 
 const db = await open({
-  filename: path.join(__dirname, "chat.db"),
+  filename: "./chat.db",
   driver: sqlite3.Database
 });
 await db.exec(`
@@ -30,43 +34,35 @@ await db.exec(`
   );
 `);
 
-// === App / HTTP ===========================================
 const app = express();
+app.set("trust proxy", 1); // necesar pe Render/alte proxie-uri
 
-// IMPORTANT: pe Render/Netlify/Heroku e în spatele unui proxy -> setează trust proxy
-app.set("trust proxy", 1); // <- asta elimină ValidatonError din express-rate-limit
-
-app.use(cors({ origin: "*"}));
+app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "256kb" }));
 
-// rate limiter blând (pe IP)
+// rate limit blând
 app.use(rateLimit({
   windowMs: 60 * 1000,
   max: 300,
   standardHeaders: true,
   legacyHeaders: false,
   skipFailedRequests: true,
-  // (opțional) poți forța IP-ul folosit:
-  keyGenerator: (req/*, res*/) => req.ip || req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown"
+  keyGenerator: (req) =>
+    req.ip ||
+    req.headers["x-forwarded-for"] ||
+    req.socket?.remoteAddress ||
+    "unknown"
 }));
 
-// Healthcheck simplu
+// Healthcheck
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// (opțional) servește static (dacă pui index.html în /public)
-// import.meta.url este ESM; dacă nu vrei static, comentează 2 linii de mai jos
-// — înlocuiește cele două rute statice —
-app.use(express.static(__dirname));
-app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "index.html")));
-
-
-// --- API REST ---
+// ====== API: istoricul de chat ======
 app.get("/api/history", async (_req, res) => {
   try {
     const rows = await db.all(
       "SELECT ts, user, text FROM messages ORDER BY id DESC LIMIT 200"
     );
-    // întoarce cronologic
     res.json(rows.reverse());
   } catch (e) {
     console.error("DB history error:", e);
@@ -74,39 +70,46 @@ app.get("/api/history", async (_req, res) => {
   }
 });
 
+// ====== API: trimite mesaj (și broadcast) ======
 app.post("/api/send", async (req, res) => {
   try {
-    let user = String(req.body?.user || "").trim();
+    let user = String(req.body?.user || "").trim() || "Anon";
     let text = String(req.body?.text || "").trim();
-    if (!text) return res.status(400).json({ ok:false, error: "empty" });
-    if (!user) user = "Anon";
+    if (!text) return res.status(400).json({ ok: false, error: "empty" });
+
     user = user.slice(0, 120);
     text = text.slice(0, 2000);
 
     const ts = Date.now();
     await db.run("INSERT INTO messages (ts,user,text) VALUES (?,?,?)", ts, user, text);
 
-    broadcast({ type:"message", data:{ ts, user, text }});
-    return res.json({ ok:true });
+    broadcast({ type: "message", data: { ts, user, text } });
+    res.json({ ok: true });
   } catch (e) {
     console.error("POST /api/send error:", e);
-    return res.status(500).json({ ok:false, error:"fail" });
+    res.status(500).json({ ok: false, error: "fail" });
   }
 });
 
-const PORT = process.env.PORT || 10000;
-const server = http.createServer(app);
+// ====== SERVEȘTE INDEX DIN MEMORIE ======
+app.get("/", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(INDEX_HTML);
+});
 
-// === WebSocket (chat live + typing + voice signaling) =====
+// (bonus) și /index.html, dacă îl accesezi direct
+app.get("/index.html", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(INDEX_HTML);
+});
+
+// ====== WebSocket (chat live + typing + voice signaling) ======
+const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 /** id -> ws */
 const peers = new Map();
 
-// heartbeat (curățare clienți morți)
-function heartbeat() { this.isAlive = true; }
-
-// broadcast utilitar
 function broadcast(obj, exceptId = null) {
   const msg = JSON.stringify(obj);
   for (const [id, ws] of peers) {
@@ -116,6 +119,9 @@ function broadcast(obj, exceptId = null) {
   }
 }
 
+// heartbeat pentru curățare conexiuni moarte
+function heartbeat() { this.isAlive = true; }
+
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
   ws._scUser = null; // userul (email) salvat la voice-join
@@ -123,19 +129,20 @@ wss.on("connection", (ws) => {
   ws.on("pong", heartbeat);
 
   peers.set(id, ws);
-  // trimite ID-ul propriu (necesar pentru WebRTC mesh)
-  ws.send(JSON.stringify({ type:"voice-id", data:{ id } }));
 
-  ws.on("close", ()=> {
+  // trimite ID-ul propriu (pentru WebRTC mesh)
+  ws.send(JSON.stringify({ type: "voice-id", data: { id } }));
+
+  ws.on("close", () => {
     peers.delete(id);
-    broadcast({ type:"voice-leave", data:{ id } }, id);
+    broadcast({ type: "voice-leave", data: { id } }, id);
   });
 
   ws.on("message", async (raw) => {
-    let payload; 
+    let payload;
     try { payload = JSON.parse(String(raw)); } catch { return; }
 
-    // === CHAT: send din WS (opțional; tu trimiți și prin REST) ===
+    // === CHAT prin WS (opțional; ai și REST) ===
     if (payload?.type === "send") {
       let user = String(payload.user || "").trim() || "Anon";
       let text = String(payload.text || "").trim();
@@ -151,33 +158,33 @@ wss.on("connection", (ws) => {
         console.error("DB insert ws send error:", e);
       }
 
-      broadcast({ type:"message", data:{ ts, user, text }});
+      broadcast({ type: "message", data: { ts, user, text } });
       return;
     }
 
-    // === TYPING: folosește "active" (nu "on") ===
+    // === TYPING (folosim "active") ===
     if (payload?.type === "typing") {
       const active = !!(payload.active ?? payload.on ?? false); // compat vechi
       const user = String(payload.user || ws._scUser || "—").slice(0, 120);
-      broadcast({ type:"typing", data:{ id, user, active } }, id);
+      broadcast({ type: "typing", data: { id, user, active } }, id);
       return;
     }
 
-    // === VOICE: presence & mute ===
+    // === VOICE presence/mute ===
     if (payload?.type === "voice-join") {
-      ws._scUser = String(payload.user || '').slice(0,120) || null;
-      broadcast({ type:"voice-join", data:{ id, user: ws._scUser || '—' } }, id);
+      ws._scUser = String(payload.user || "").slice(0, 120) || null;
+      broadcast({ type: "voice-join", data: { id, user: ws._scUser || "—" } }, id);
       return;
     }
 
     if (payload?.type === "voice-leave") {
-      broadcast({ type:"voice-leave", data:{ id } }, id);
+      broadcast({ type: "voice-leave", data: { id } }, id);
       return;
     }
 
     if (payload?.type === "voice-mute") {
       const muted = !!payload.muted;
-      broadcast({ type:"voice-mute", data:{ id, muted } }, id);
+      broadcast({ type: "voice-mute", data: { id, muted } }, id);
       return;
     }
 
@@ -196,13 +203,13 @@ wss.on("connection", (ws) => {
   });
 });
 
-// ping/pong la 30s ca să închidem conexiunile „moarte”
+// ping/pong la 30s
 const interval = setInterval(() => {
   for (const [id, ws] of peers) {
     if (ws.isAlive === false) {
       try { ws.terminate(); } catch {}
       peers.delete(id);
-      broadcast({ type:"voice-leave", data:{ id } }, id);
+      broadcast({ type: "voice-leave", data: { id } }, id);
       continue;
     }
     ws.isAlive = false;
@@ -212,6 +219,7 @@ const interval = setInterval(() => {
 
 wss.on("close", () => clearInterval(interval));
 
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log("Chat server on :"+PORT);
+  console.log("[BOOT] Listening on " + PORT);
 });
