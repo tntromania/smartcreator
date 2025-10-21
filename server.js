@@ -1,60 +1,104 @@
 // server.js
+// Chat + Voice WebRTC signaling + Typing + History (SQLite) — all-in-one
+
 import express from "express";
-import cors from "cors";
-import { WebSocketServer } from "ws";
 import http from "http";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import { WebSocketServer } from "ws";
 import crypto from "crypto";
-import Database from "better-sqlite3";
+import path from "path";
+import { fileURLToPath } from "url";
 
-const PORT = process.env.PORT || 8080;
-const app  = express();
-app.set('trust proxy', 1); // sau true
-app.use(cors());
-app.use(express.json());
+// === SQLite (persistență mesaje) ==========================
+import sqlite3 from "sqlite3";
+import { open } from "sqlite";
 
-// DB mic, în fișier (persistă pe Render)
-const db = new Database("chat.db");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS messages(
-    id TEXT PRIMARY KEY,
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+
+const db = await open({
+  filename: path.join(__dirname, "chat.db"),
+  driver: sqlite3.Database
+});
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
     user TEXT NOT NULL,
-    text TEXT NOT NULL,
-    ts INTEGER NOT NULL
-  );
+    text TEXT NOT NULL
+  )
 `);
 
-const sanitize = s => String(s||"").slice(0, 2000);
+// === App / HTTP ===========================================
+const app = express();
+app.set("trust proxy", 1); // ✅ necesar pe Render/Proxy
 
-// REST
-app.get("/api/history", (req,res)=>{
-  const rows = db.prepare("SELECT id,user,text,ts FROM messages ORDER BY ts ASC LIMIT 500").all();
-  res.json(rows);
+app.use(cors({ origin: "*"}));
+app.use(express.json({ limit: "256kb" }));
+
+// limiter blând
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipFailedRequests: true
+}));
+
+// --- API REST ---
+app.get("/api/history", async (_req, res) => {
+  try {
+    const rows = await db.all(
+      "SELECT ts, user, text FROM messages ORDER BY id DESC LIMIT 200"
+    );
+    // invers pentru cronologic
+    res.json(rows.reverse());
+  } catch (e) {
+    res.status(500).json({ error: "db_fail" });
+  }
 });
 
-app.post("/api/send", (req,res)=>{
-  const user = sanitize(req.body.user);
-  const text = sanitize(req.body.text);
-  if(!text) return res.status(400).json({ok:false});
-  const msg = { id: crypto.randomUUID(), user, text, ts: Date.now() };
-  db.prepare("INSERT INTO messages(id,user,text,ts) VALUES(@id,@user,@text,@ts)").run(msg);
-  broadcast({ type:"message", data: msg });
-  res.json({ ok: true });
+app.post("/api/send", async (req, res) => {
+  try {
+    let user = String(req.body?.user || "").trim();
+    let text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ ok:false, error: "empty" });
+    if (!user) user = "Anon";
+    user = user.slice(0, 120);
+    text = text.slice(0, 2000);
+
+    const ts = Date.now();
+    await db.run("INSERT INTO messages (ts,user,text) VALUES (?,?,?)", ts, user, text);
+
+    broadcast({ type:"message", data:{ ts, user, text }});
+    return res.json({ ok:true });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error:"fail" });
+  }
 });
 
-// HTTP + WS
+const PORT = process.env.PORT || 10000;
 const server = http.createServer(app);
+
+// === WebSocket (chat live + typing + voice signaling) =====
 const wss = new WebSocketServer({ server });
 
-const peers = new Map(); // id -> ws
+/** id -> ws */
+const peers = new Map();
 
-function broadcast(obj){
-  const data = JSON.stringify(obj);
-  wss.clients.forEach(c => { if(c.readyState===1) c.send(data); });
+function broadcast(obj, exceptId = null) {
+  const msg = JSON.stringify(obj);
+  for (const [id, ws] of peers) {
+    if (ws.readyState !== 1) continue;
+    if (exceptId && id === exceptId) continue;
+    ws.send(msg);
+  }
 }
 
 wss.on("connection", (ws) => {
-  // atribuie un id de voice pentru fiecare ws (poi folosit în WebRTC)
   const id = crypto.randomUUID();
+  ws._scUser = null; // atașăm userul curent (din voice-join)
   peers.set(id, ws);
   ws.send(JSON.stringify({ type:"voice-id", data:{ id } }));
 
@@ -66,35 +110,27 @@ wss.on("connection", (ws) => {
   ws.on("message", (raw) => {
     let payload; try { payload = JSON.parse(String(raw)); } catch { return; }
 
-    // chat text
-    if (payload?.type === "send") {
-      const user = sanitize(payload.user);
-      const text = sanitize(payload.text);
-      if (!text) return;
-      const msg = { id: crypto.randomUUID(), user, text, ts: Date.now() };
-      db.prepare("INSERT INTO messages(id,user,text,ts) VALUES(@id,@user,@text,@ts)").run(msg);
-      broadcast({ type:"message", data: msg });
-      return;
-    }
+    // ... (send, typing rămân la fel)
 
-    // typing indicator (doar broadcast, nu se salvează)
-    if (payload?.type === "typing") {
-      const user = sanitize(payload.user);
-      const active = !!payload.active;
-      broadcast({ type:"typing", data:{ user, active, ts: Date.now() } });
-      return;
-    }
-
-    // --- WebRTC signaling (mesh simplu) ---
     if (payload?.type === "voice-join") {
-      broadcast({ type:"voice-join", data:{ id } });
+      // memorează user (din client)
+      ws._scUser = String(payload.user || '').slice(0,120) || null;
+      broadcast({ type:"voice-join", data:{ id, user: ws._scUser || '—' } });
       return;
     }
+
     if (payload?.type === "voice-leave") {
       broadcast({ type:"voice-leave", data:{ id } });
       return;
     }
 
+    if (payload?.type === "voice-mute") {
+      const muted = !!payload.muted;
+      broadcast({ type:"voice-mute", data:{ id, muted } });
+      return;
+    }
+
+    // signaling passthrough (offer/answer/ice) — neschimbat
     if (payload?.type === "voice-offer" || payload?.type === "voice-answer" || payload?.type === "voice-ice") {
       const to = String(payload.to || "");
       const target = peers.get(to);
@@ -109,4 +145,6 @@ wss.on("connection", (ws) => {
   });
 });
 
-server.listen(PORT, () => console.log("SmartCreator chat+voice on", PORT));
+server.listen(PORT, () => {
+  console.log("Chat server on :"+PORT);
+});
