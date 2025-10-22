@@ -24,23 +24,37 @@ app.use(express.json({ limit: '256kb' }));
 // CORS permisiv dar controlabil prin CORS_ORIGIN
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true);                // curl / same-origin / test harness
-    if (!CORS_ORIGIN.length) return cb(null, true);    // fallback: allow all
+    if (!origin) return cb(null, true);
+    if (!CORS_ORIGIN.length) return cb(null, true);
     if (CORS_ORIGIN.includes('*')) return cb(null, true);
-    try {
-      const o = new URL(origin);
-      const ok = CORS_ORIGIN.some(a => {
-        try { const u = new URL(a); return u.host === o.host; }
-        catch { return a === origin; }
-      });
-      if (ok) return cb(null, true);
-    } catch {}
-    return cb(new Error('CORS blocked: ' + origin));
+
+    let host = '';
+    try { host = new URL(origin).hostname; } catch { return cb(new Error('CORS blocked: ' + origin)); }
+
+    const ok = CORS_ORIGIN.some(raw => {
+      let pat = String(raw || '').trim();
+      if (!pat) return false;
+
+      // dacă e URL normal, extragem hostname
+      try { pat = new URL(pat).hostname; } catch {}
+
+      // exact match
+      if (pat === host) return true;
+
+      // wildcard-uri simple: *.domeniu.tld sau *ceva.tld
+      if (pat.startsWith('*.')) return host === pat.slice(2) || host.endsWith(pat.slice(1));
+      if (pat.startsWith('*'))  return host.endsWith(pat.slice(1));
+
+      return false;
+    });
+
+    return ok ? cb(null, true) : cb(new Error('CORS blocked: ' + origin));
   },
   credentials: true,
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization']
 }));
+
 app.options('*', cors());
 
 // ===== Level/XP config =====
