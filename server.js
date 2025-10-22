@@ -189,10 +189,30 @@ app.post('/api/xp/earn', async (req, res) => {
 /* GET /api/xp/leaderboard?period=7d */
 app.get('/api/xp/leaderboard', async (req, res) => {
   try {
-    const period = String(req.query.period || '7d').toLowerCase();
-    const map = { '7d': "7 days", '30d': "30 days", '24h': "24 hours" };
-    const span = map[period] || "7 days";
-    const since = new Date(Date.now() - (span.includes('hours') ? 24*60*60*1000 : 7*24*60*60*1000));
+    const period = String(req.query.period || 'all').toLowerCase();
+
+    if (period === 'all') {
+      const { data, error } = await supa
+        .from('profiles')
+        .select('user_id, full_name, email, xp')
+        .order('xp', { ascending: false })
+        .limit(20);
+
+      if (error) throw error;
+      return res.json((data || []).map(r => ({
+        user_id: r.user_id,
+        full_name: r.full_name || (r.email ? r.email.split('@')[0] : 'User'),
+        email: r.email,
+        xp: Math.max(0, r.xp || 0)
+      })));
+    }
+
+    // fallback – perioade (7d, 30d) din xp_events
+    const map = { '7d': '7 days', '30d': '30 days', '24h': '24 hours' };
+    const span = map[period] || '7 days';
+    const since = new Date(Date.now() - (
+      span.includes('hours') ? 24*60*60*1000 : 7*24*60*60*1000
+    ));
     const { data, error } = await supa.rpc('xp_leaderboard', { since: since.toISOString() });
     if (error) throw error;
     res.json(data || []);
@@ -201,6 +221,7 @@ app.get('/api/xp/leaderboard', async (req, res) => {
     res.status(500).json({ error: 'xp-leaderboard-failed' });
   }
 });
+
 
 /* ---------- Chat API ---------- */
 app.get('/api/history', async (req, res) => {
