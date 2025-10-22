@@ -209,12 +209,21 @@ app.post('/api/send', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
-    // XP + nume/nivel pentru broadcast
-    const xpInfo = await awardXPByEmail(email, text);
-    const displayName = xpInfo?.name || name || email;
-    const displayLevel = xpInfo?.level || undefined;
+// XP + nume/nivel pentru broadcast (fallback când e cooldown)
+   let xpInfo = await awardXPByEmail(email, text);
+if (!xpInfo) {
+  const { data: prof } = await supa
+    .from('profiles')
+    .select('full_name,level')
+    .eq('email', email)
+    .maybeSingle();
+  xpInfo = { name: (prof?.full_name || name || email), level: (prof?.level || 1) };
+}
+const displayName  = xpInfo.name;
+const displayLevel = xpInfo.level;
 
-    broadcast({ type: 'message', data: { ...row, user: displayName, level: displayLevel } });
+broadcast({ type: 'message', data: { ...row, user: displayName, level: displayLevel } });
+
     res.json({ ok: true });
   } catch (e) {
     console.error('[SEND] Exception:', e);
@@ -258,11 +267,20 @@ wss.on('connection', ws => {
         return;
       }
 
-      const xpInfo = await awardXPByEmail(email, row.text);
-      const displayName = xpInfo?.name || msg.name || email;
-      const displayLevel = xpInfo?.level || undefined;
+let xpInfo = await awardXPByEmail(email, row.text);
+if (!xpInfo) {
+  const { data: prof } = await supa
+    .from('profiles')
+    .select('full_name,level')
+    .eq('email', email)
+    .maybeSingle();
+  xpInfo = { name: (prof?.full_name || msg.name || email), level: (prof?.level || 1) };
+}
+const displayName  = xpInfo.name;
+const displayLevel = xpInfo.level;
 
-      broadcast({ type:'message', data: { ...row, user: displayName, level: displayLevel } });
+broadcast({ type:'message', data: { ...row, user: displayName, level: displayLevel } });
+
     }
 
     // typing passthrough
