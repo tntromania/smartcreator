@@ -1,231 +1,134 @@
-require('dotenv').config();
-
-const http = require('http');
+// server.js
 const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 
 const PORT = process.env.PORT || 10000;
-const CHAT_ROOM = process.env.CHAT_ROOM || 'global';
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const CHAT_ROOM = process.env.CHAT_ROOM || 'global';
+const CORS_ORIGIN = (process.env.CORS_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 
+// ---- sanity checks
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error('❌ Lipsesc SUPABASE_URL sau SUPABASE_SERVICE_KEY in env.');
-  process.exit(1);
+  console.error('[FATAL] Lipsesc env SUPABASE_URL sau SUPABASE_SERVICE_KEY. Vezi Render -> Environment.');
+  // nu ies — pornesc totuși ca să vezi clar la /healthz ce lipsește
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: { autoRefreshToken: false, persistSession: false }
-});
+const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const app = express();
+app.use(express.json({ limit: '256kb' }));
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);               // same-origin / curl
+    if (!CORS_ORIGIN.length) return cb(null, true);   // fallback: allow all
+    if (CORS_ORIGIN.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS blocked: ' + origin));
+  },
+  credentials: true
+}));
 
-// CORS permis (din env sau toate in dev)
-let corsOrigins = true;
-if (process.env.CORS_ORIGIN && process.env.CORS_ORIGIN.trim().length) {
-  corsOrigins = process.env.CORS_ORIGIN.split(',').map(s => s.trim());
-}
-app.use(cors({ origin: corsOrigins, credentials: true }));
-app.use(express.json({ limit: '1mb' }));
-
-// --- Helpers ---
-function nowMs() { return Date.now(); }
-function clampText(s, max = 3000) {
-  s = String(s || '');
-  if (s.length > max) s = s.slice(0, max);
-  return s;
-}
-
-// --- REST: health ---
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, ts: nowMs() });
+app.get('/healthz', (req, res) => {
+  res.json({
+    ok: true,
+    room: CHAT_ROOM,
+    cors: CORS_ORIGIN,
+    supa_url_set: !!SUPABASE_URL,
+    service_key_set: !!SUPABASE_SERVICE_KEY
+  });
 });
 
-// --- REST: history (ultimele N mesaje, ordonate ASC) ---
+// === Chat API ===
 app.get('/api/history', async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit || '300', 10), 1000);
-
-    const { data, error } = await supabase
+    const { data, error } = await supa
       .from('chat_messages')
-      .select('cid,user,text,ts')
+      .select('cid,user,text,ts,room')
       .eq('room', CHAT_ROOM)
       .order('ts', { ascending: true })
-      .limit(limit);
-
-    if (error) throw error;
+      .limit(500);
+    if (error) {
+      console.error('[HISTORY] Supabase error:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
     res.json(data || []);
-  } catch (err) {
-    console.error('GET /api/history error:', err);
-    res.status(500).json([]);
+  } catch (e) {
+    console.error('[HISTORY] Exception:', e);
+    res.status(500).json({ error: 'history-failed' });
   }
 });
 
-// --- REST: send (fallback cand WS nu e disponibil) ---
 app.post('/api/send', async (req, res) => {
   try {
-    const cid = String(req.body.cid || '');
-    const user = clampText(req.body.user || 'Anon', 200);
-    const text = clampText(req.body.text || '', 3000);
-    const ts = Number.isFinite(+req.body.ts) ? +req.body.ts : nowMs();
-    if (!text.trim()) return res.status(400).json({ ok: false });
+    const { user, text, cid, ts } = req.body || {};
+    const row = {
+      room: CHAT_ROOM,
+      cid: cid || null,
+      user: String(user || 'Anon').slice(0, 160),
+      text: String(text || '').slice(0, 4000),
+      ts: Number(ts || Date.now())
+    };
 
-    const row = { room: CHAT_ROOM, cid, user, text, ts };
-    const { error } = await supabase.from('chat_messages').insert(row);
-    if (error) throw error;
+    const { error } = await supa.from('chat_messages').insert(row);
+    if (error) {
+      console.error('[SEND] Supabase insert error:', error.message, { row });
+      return res.status(500).json({ error: error.message });
+    }
 
-    // Broadcast si catre WS-uri (daca sunt conectate)
-    broadcastAll({ type: 'message', data: row });
-
+    // broadcast prin WS
+    broadcast({ type: 'message', data: row });
     res.json({ ok: true });
-  } catch (err) {
-    console.error('POST /api/send error:', err);
-    res.status(500).json({ ok: false });
+  } catch (e) {
+    console.error('[SEND] Exception:', e);
+    res.status(500).json({ error: 'send-failed' });
   }
 });
 
-const server = http.createServer(app);
+// === HTTP server + WS ===
+const server = app.listen(PORT, () => {
+  console.log(`[BOOT] Port=${PORT} Room=${CHAT_ROOM}`);
+  console.log(`[BOOT] CORS whitelist:`, CORS_ORIGIN.length ? CORS_ORIGIN : '(all)');
+  console.log(`[BOOT] Supabase URL set:`, !!SUPABASE_URL);
+  console.log(`[BOOT] Service key set:`, !!SUPABASE_SERVICE_KEY);
+});
 
-// --- WebSocket ---
 const wss = new WebSocketServer({ server });
-const clients = new Map(); // id -> { ws, user }
-
-function uid() {
-  return [...crypto.getRandomValues(new Uint8Array(8))]
-    .map(x => x.toString(16).padStart(2, '0')).join('');
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach(c => { try { if (c.readyState === 1) c.send(msg); } catch {} });
 }
 
-// fallback pentru Node <19 (daca nu exista globalThis.crypto)
-let crypto = globalThis.crypto;
-if (!crypto || !crypto.getRandomValues) {
-  crypto = require('crypto').webcrypto;
-}
+wss.on('connection', ws => {
+  ws.on('message', async buf => {
+    let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-function broadcastAll(msgObj, exceptId = null) {
-  const payload = JSON.stringify(msgObj);
-  for (const [id, c] of clients) {
-    if (exceptId && id === exceptId) continue;
-    if (c.ws.readyState === 1) c.ws.send(payload);
-  }
-}
-
-function sendTo(targetId, msgObj) {
-  const c = clients.get(targetId);
-  if (!c || c.ws.readyState !== 1) return;
-  c.ws.send(JSON.stringify(msgObj));
-}
-
-// Ping/pong keepalive (ajuta impotriva timeouts)
-function heartbeat() { this.isAlive = true; }
-setInterval(() => {
-  for (const [id, c] of clients) {
-    if (c.ws.isAlive === false) {
-      try { c.ws.terminate(); } catch {}
-      clients.delete(id);
-      // anunta voice-leave pentru cei care il aveau in room
-      broadcastAll({ type: 'voice-leave', data: { id } });
-      continue;
-    }
-    c.ws.isAlive = false;
-    try { c.ws.ping(); } catch {}
-  }
-}, 25000);
-
-wss.on('connection', (ws) => {
-  ws.isAlive = true;
-  ws.on('pong', heartbeat);
-
-  const id = uid();
-  clients.set(id, { ws, user: '—' });
-
-  // Trimite id-ul clientului
-  try {
-    ws.send(JSON.stringify({ type: 'voice-id', data: { id } }));
-  } catch {}
-
-  ws.on('message', async (raw) => {
-    let msg = null;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    // tipuri: typing, send, voice-join, voice-leave, voice-mute, voice-offer, voice-answer, voice-ice
-    if (msg.type === 'typing') {
-      const user = clampText(msg.user || 'Anon', 200);
-      clients.get(id).user = user;
-      // broadcast la toti (in afara de sine)
-      broadcastAll({ type: 'typing', data: { id, active: !!msg.active, user } }, id);
-      return;
-    }
-
-    if (msg.type === 'send') {
-      const user = clampText(msg.user || 'Anon', 200);
-      const text = clampText(msg.text || '', 3000);
-      const cid = String(msg.cid || '');
-      const ts = Number.isFinite(+msg.ts) ? +msg.ts : nowMs();
-
-      if (!text.trim()) return;
-
-      const row = { room: CHAT_ROOM, cid, user, text, ts };
-      // persist in Supabase
-      try {
-        const { error } = await supabase.from('chat_messages').insert(row);
-        if (error) console.error('Supabase insert error:', error);
-      } catch (e) {
-        console.error('Supabase insert exception:', e);
+    // clientul trimite {type:'send', user, text, cid}
+    if (msg?.type === 'send') {
+      const row = {
+        room: CHAT_ROOM,
+        cid: msg.cid || null,
+        user: String(msg.user || 'Anon').slice(0, 160),
+        text: String(msg.text || '').slice(0, 4000),
+        ts: Date.now()
+      };
+      const { error } = await supa.from('chat_messages').insert(row);
+      if (error) {
+        console.error('[WS send] insert error:', error.message);
+        try { ws.send(JSON.stringify({ type:'error', error: error.message })); } catch {}
+        return;
       }
-
-      // broadcast catre toti (inclusiv senderul — front-ul are deja optimistic)
-      broadcastAll({ type: 'message', data: row });
-      return;
+      broadcast({ type:'message', data: row });
     }
 
-    if (msg.type === 'voice-join') {
-      const user = clampText(msg.user || 'Anon', 200);
-      clients.get(id).user = user;
-      // anunta pe ceilalti
-      broadcastAll({ type: 'voice-join', data: { id, user } }, id);
-      return;
-    }
-
-    if (msg.type === 'voice-leave') {
-      broadcastAll({ type: 'voice-leave', data: { id } }, id);
-      return;
-    }
-
-    if (msg.type === 'voice-mute') {
-      const muted = !!msg.muted;
-      broadcastAll({ type: 'voice-mute', data: { id, muted } }, id);
-      return;
-    }
-
-    // WebRTC signaling (targetat)
-    if (msg.type === 'voice-offer' && msg.to && msg.sdp) {
-      sendTo(msg.to, { type: 'voice-offer', data: { from: id, sdp: msg.sdp } });
-      return;
-    }
-    if (msg.type === 'voice-answer' && msg.to && msg.sdp) {
-      sendTo(msg.to, { type: 'voice-answer', data: { from: id, sdp: msg.sdp } });
-      return;
-    }
-    if (msg.type === 'voice-ice' && msg.to && msg.candidate) {
-      sendTo(msg.to, { type: 'voice-ice', data: { from: id, candidate: msg.candidate } });
-      return;
+    // typing passthrough
+    if (msg?.type === 'typing') {
+      broadcast({ type:'typing', data: { active: !!msg.active, user: msg.user || 'Anon', id: ws._id || '' } });
     }
   });
 
-  ws.on('close', () => {
-    clients.delete(id);
-    // anunta plecarea in voice
-    broadcastAll({ type: 'voice-leave', data: { id } });
-  });
-
-  ws.on('error', (e) => {
-    console.error('WS error:', e?.message || e);
-  });
-});
-
-server.listen(PORT, () => {
-  console.log(`✅ HTTP+WS server pornit pe :${PORT}`);
+  // id simplu pt typing
+  ws._id = Math.random().toString(16).slice(2);
+  try { ws.send(JSON.stringify({ type:'hello', id: ws._id })); } catch {}
 });
