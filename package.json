@@ -1,12 +1,20 @@
 {
-  "type": "module",
-  "scripts": { "start": "node server.js" },
+  "name": "smartcreator-chat-server",
+  "version": "1.0.0",
+  "description": "Chat + Voice signaling server (Express + ws) cu persistenta in Supabase",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
+    "@supabase/supabase-js": "^2.45.3",
     "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "express-rate-limit": "^7.4.0",
-    "sqlite": "5.1.1",
-    "sqlite3": "^5.1.7",
     "ws": "^8.18.0"
   }
 }
