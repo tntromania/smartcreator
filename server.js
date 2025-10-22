@@ -8,69 +8,189 @@ const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const CHAT_ROOM = process.env.CHAT_ROOM || 'global';
+const CORS_ORIGIN = (process.env.CORS_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 
-// Sanitize CORS_ORIGIN (în caz că ai pus din greșeală "CORS_ORIGIN=" în Value)
-const ORIGINS_RAW = (process.env.CORS_ORIGIN || '').replace(/^CORS_ORIGIN=/, '');
-const CORS_ORIGIN = ORIGINS_RAW.split(',').map(s => s.trim()).filter(Boolean);
-const ALLOW_NULL_ORIGIN = process.env.ALLOW_NULL_ORIGIN === '1';
-
-// ── sanity
+// ---- sanity checks
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error('[FATAL] Lipsesc SUPABASE_URL / SUPABASE_SERVICE_KEY (Render → Settings → Environment).');
+  console.error('[FATAL] Lipsesc env SUPABASE_URL sau SUPABASE_SERVICE_KEY. Vezi Render -> Environment.');
+  // pornesc oricum ca să poți vedea la /healthz
 }
 
 const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// === Express mai întâi, apoi .use(...)
 const app = express();
+app.use(express.json({ limit: '256kb' }));
 
-const corsOptions = {
+// CORS permisiv dar controlabil prin CORS_ORIGIN
+app.use(cors({
   origin(origin, cb) {
-    // 1) Permite fără Origin (ex: same-origin, curl, unele preflight-uri)
-    if (!origin || origin === 'null') {
-      return ALLOW_NULL_ORIGIN ? cb(null, true) : cb(new Error('CORS blocked: null'));
-    }
-
-    // 2) Dacă n-ai setat listă → permite tot
-    if (!CORS_ORIGIN.length) return cb(null, true);
-
-    // 3) wildcard
+    if (!origin) return cb(null, true);                // curl / same-origin / test harness
+    if (!CORS_ORIGIN.length) return cb(null, true);    // fallback: allow all
     if (CORS_ORIGIN.includes('*')) return cb(null, true);
-
-    // 4) match pe host (acceptă http/https)
     try {
       const o = new URL(origin);
       const ok = CORS_ORIGIN.some(a => {
-        try { return new URL(a).host === o.host; }
+        try { const u = new URL(a); return u.host === o.host; }
         catch { return a === origin; }
       });
-      return ok ? cb(null, true) : cb(new Error('CORS blocked: ' + origin));
-    } catch {
-      return cb(new Error('CORS blocked: ' + origin));
-    }
+      if (ok) return cb(null, true);
+    } catch {}
+    return cb(new Error('CORS blocked: ' + origin));
   },
   credentials: true,
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+app.options('*', cors());
+
+// ===== Level/XP config =====
+const XP_RULES = {
+  chat_message:     { amount: 2,  cooldownSec: 15,  dailyCap: 60 }, // ~30 mesaje/zi contorizate
+  lesson_complete:  { amount: 40, perKey: true },                   // meta.key = lessonId
+  quiz_pass:        { amount: 25, perKey: true },                   // meta.key = lessonId
+  voice_join:       { amount: 10, cooldownSec: 300, dailyCap: 20 }, // max ~2/zi
+  profile_complete: { amount: 20, once: true }                      // o singură dată
 };
 
-app.use(express.json({ limit: '256kb' }));
-app.use(cors(corsOptions));
-// preflight helper
-app.options('*', cors(corsOptions));
+// verifică token-ul Supabase și returnează user-ul
+async function getUserFromToken(token) {
+  if (!token) return null;
+  try {
+    const { data, error } = await supa.auth.getUser(token);
+    if (error) return null;
+    return data?.user || null;
+  } catch { return null; }
+}
 
+// helper: today UTC
+function startOfTodayUTC() {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())).toISOString();
+}
+
+// calculează progres nivel (fără persist)
+function levelFromXp(total) {
+  let lvl = 1, need = 100, step = 40, xp = Math.max(0, total);
+  while (xp >= need) { xp -= need; lvl++; need += step; if (lvl > 999) break; }
+  return { level: lvl, cur: xp, next: need, total, pct: Math.round((xp/need)*100) };
+}
+
+// ===== Health =====
 app.get('/healthz', (req, res) => {
   res.json({
     ok: true,
     room: CHAT_ROOM,
     cors: CORS_ORIGIN,
-    allow_null_origin: ALLOW_NULL_ORIGIN,
     supa_url_set: !!SUPABASE_URL,
     service_key_set: !!SUPABASE_SERVICE_KEY
   });
 });
 
-// === Chat API
+// ===== XP: eu =====
+app.get('/api/xp/me', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i,'') || req.query.token;
+    const user = await getUserFromToken(token);
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+
+    const { data } = await supa.from('user_xp').select('xp').eq('user_id', user.id).maybeSingle();
+    const xp = data?.xp || 0;
+    res.json(levelFromXp(xp));
+  } catch (e) {
+    console.error('[xp/me] ', e);
+    res.status(500).json({ error: 'xp-me-failed' });
+  }
+});
+
+// ===== XP: earn =====
+app.post('/api/xp/earn', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i,'') || req.body?.token;
+    const user = await getUserFromToken(token);
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+
+    const { type, meta = {} } = req.body || {};
+    const rule = XP_RULES[type];
+    if (!rule) return res.status(400).json({ error: 'unknown-type' });
+
+    const sinceToday = startOfTodayUTC();
+
+    // once
+    if (rule.once) {
+      const { data: once } = await supa
+        .from('xp_events').select('id', { count: 'exact', head: true })
+        .eq('user_id', user.id).eq('type', type);
+      if ((once?.length ?? 0) > 0) return res.json({ ok: true, skipped: 'once', ...levelFromXp((await currentXp(user.id))) });
+    }
+
+    // perKey
+    if (rule.perKey) {
+      const k = String(meta.key || '').trim();
+      if (!k) return res.status(400).json({ error: 'missing-meta-key' });
+      const { data: exists } = await supa
+        .from('xp_events').select('id', { count: 'exact', head: true })
+        .eq('user_id', user.id).eq('type', type).contains('meta', { key: k });
+      if ((exists?.length ?? 0) > 0) return res.json({ ok: true, skipped: 'perKey', ...levelFromXp((await currentXp(user.id))) });
+    }
+
+    // daily cap
+    if (rule.dailyCap) {
+      const { data: today } = await supa
+        .from('xp_events').select('amount')
+        .eq('user_id', user.id).eq('type', type)
+        .gte('created_at', sinceToday);
+      const todaySum = (today || []).reduce((s, r) => s + (r.amount || 0), 0);
+      if (todaySum >= rule.dailyCap) return res.json({ ok: true, skipped: 'daily-cap', ...levelFromXp((await currentXp(user.id))) });
+    }
+
+    // cooldown
+    if (rule.cooldownSec) {
+      const { data: last } = await supa
+        .from('xp_events').select('created_at')
+        .eq('user_id', user.id).eq('type', type)
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      if (last?.created_at) {
+        const diff = (Date.now() - new Date(last.created_at).getTime()) / 1000;
+        if (diff < rule.cooldownSec) return res.json({ ok: true, skipped: 'cooldown', ...levelFromXp((await currentXp(user.id))) });
+      }
+    }
+
+    // grant XP prin RPC
+    const { data: newTotal, error } = await supa.rpc('add_xp', {
+      uid: user.id, delta: rule.amount, ev_type: type, ev_meta: meta
+    });
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ ok: true, ...levelFromXp(newTotal || 0) });
+  } catch (e) {
+    console.error('[xp/earn] ', e);
+    res.status(500).json({ error: 'xp-earn-failed' });
+  }
+});
+
+async function currentXp(uid){
+  const { data } = await supa.from('user_xp').select('xp').eq('user_id', uid).maybeSingle();
+  return data?.xp || 0;
+}
+
+// ===== XP: leaderboard =====
+app.get('/api/xp/leaderboard', async (req, res) => {
+  try {
+    const period = String(req.query.period || '7d');
+    let since = new Date(0).toISOString();
+    if (period === '7d')  since = new Date(Date.now() - 7*864e5).toISOString();
+    if (period === '30d') since = new Date(Date.now() - 30*864e5).toISOString();
+
+    const { data, error } = await supa.rpc('xp_leaderboard', { since });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (e) {
+    console.error('[xp/leaderboard] ', e);
+    res.status(500).json({ error: 'xp-leaderboard-failed' });
+  }
+});
+
+// === Chat API ===
 app.get('/api/history', async (req, res) => {
   try {
     const { data, error } = await supa
@@ -115,50 +235,31 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
-// === HTTP + WS
+// === HTTP server + WS ===
 const server = app.listen(PORT, () => {
   console.log(`[BOOT] Port=${PORT} Room=${CHAT_ROOM}`);
   console.log(`[BOOT] CORS whitelist:`, CORS_ORIGIN.length ? CORS_ORIGIN : '(all)');
-  console.log(`[BOOT] allow null origin:`, ALLOW_NULL_ORIGIN);
   console.log(`[BOOT] Supabase URL set:`, !!SUPABASE_URL);
   console.log(`[BOOT] Service key set:`, !!SUPABASE_SERVICE_KEY);
 });
 
 const wss = new WebSocketServer({ server });
-const clients = new Map(); // id -> ws
-
 function broadcast(obj) {
   const msg = JSON.stringify(obj);
-  for (const c of wss.clients) {
-    try { if (c.readyState === 1) c.send(msg); } catch {}
-  }
-}
-function sendTo(id, obj) {
-  const ws = clients.get(id);
-  if (ws && ws.readyState === 1) {
-    try { ws.send(JSON.stringify(obj)); } catch {}
-  }
+  wss.clients.forEach(c => { try { if (c.readyState === 1) c.send(msg); } catch {} });
 }
 
 wss.on('connection', ws => {
-  ws._id = Math.random().toString(16).slice(2);
-  clients.set(ws._id, ws);
-
-  // Trimite ID-ul către client (frontend-ul tău așteaptă 'voice-id')
-  try { ws.send(JSON.stringify({ type: 'voice-id', data: { id: ws._id } })); } catch {}
-
-  ws.on('close', () => { clients.delete(ws._id); });
-
   ws.on('message', async buf => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-    // chat text
+    // clientul trimite {type:'send', user, text, cid}
     if (msg?.type === 'send') {
       const row = {
         room: CHAT_ROOM,
         cid: msg.cid || null,
-        user: String(msg.user || 'Anon').slice(0,160),
-        text: String(msg.text || '').slice(0,4000),
+        user: String(msg.user || 'Anon').slice(0, 160),
+        text: String(msg.text || '').slice(0, 4000),
         ts: Date.now()
       };
       const { error } = await supa.from('chat_messages').insert(row);
@@ -170,18 +271,13 @@ wss.on('connection', ws => {
       broadcast({ type:'message', data: row });
     }
 
-    // typing
+    // typing passthrough
     if (msg?.type === 'typing') {
-      broadcast({ type:'typing', data: { active: !!msg.active, user: msg.user || 'Anon', id: ws._id } });
+      broadcast({ type:'typing', data: { active: !!msg.active, user: msg.user || 'Anon', id: ws._id || '' } });
     }
-
-    // ── semnalizare WebRTC (voice) – passthrough
-    if (msg?.type === 'voice-join')  broadcast({ type: 'voice-join',  data: { id: ws._id, user: msg.user || '—' } });
-    if (msg?.type === 'voice-leave') broadcast({ type: 'voice-leave', data: { id: ws._id } });
-    if (msg?.type === 'voice-mute')  broadcast({ type: 'voice-mute',  data: { id: ws._id, muted: !!msg.muted } });
-
-    if (msg?.type === 'voice-offer')  sendTo(msg.to, { type:'voice-offer',  data:{ from: ws._id, sdp: msg.sdp } });
-    if (msg?.type === 'voice-answer') sendTo(msg.to, { type:'voice-answer', data:{ from: ws._id, sdp: msg.sdp } });
-    if (msg?.type === 'voice-ice')    sendTo(msg.to, { type:'voice-ice',    data:{ from: ws._id, candidate: msg.candidate } });
   });
+
+  // id simplu pt typing
+  ws._id = Math.random().toString(16).slice(2);
+  try { ws.send(JSON.stringify({ type:'hello', id: ws._id })); } catch {}
 });
