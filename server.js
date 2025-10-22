@@ -21,14 +21,40 @@ const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const app = express();
 app.use(express.json({ limit: '256kb' }));
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);               // same-origin / curl
-    if (!CORS_ORIGIN.length) return cb(null, true);   // fallback: allow all
-    if (CORS_ORIGIN.includes(origin)) return cb(null, true);
+  origin(origin, cb) {
+    // 1) permite request-uri fără Origin (same-origin, curl, preflight exotic)
+    if (!origin) return cb(null, true);
+
+    // 2) dacă nu ai setat nimic în env, permite tot
+    if (!CORS_ORIGIN.length) return cb(null, true);
+
+    // 3) wildcard suport
+    if (CORS_ORIGIN.includes('*')) return cb(null, true);
+
+    // 4) match direct sau pe host (ex: http/https, subdomain)
+    try {
+      const o = new URL(origin);
+      const ok = CORS_ORIGIN.some(a => {
+        try { 
+          const u = new URL(a);
+          return u.host === o.host; // acceptă aceeași gazdă, indiferent de schemă
+        } catch {
+          return a === origin;      // string exact
+        }
+      });
+      if (ok) return cb(null, true);
+    } catch {}
+
     return cb(new Error('CORS blocked: ' + origin));
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization']
 }));
+
+// preflight helper (optional)
+app.options('*', cors());
+
 
 app.get('/healthz', (req, res) => {
   res.json({
