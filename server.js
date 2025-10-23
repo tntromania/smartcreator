@@ -325,10 +325,20 @@ function broadcast(obj) {
   wss.clients.forEach(c => { try { if (c.readyState === 1) c.send(msg); } catch {} });
 }
 
+/* ====== STATE: cine e pe voice acum ====== */
+const voicePeers = new Map(); // id -> { user, muted }
+
 wss.on('connection', ws => {
   ws._id = Math.random().toString(16).slice(2);
+
   // trimite id-ul pentru voice signaling
   try { ws.send(JSON.stringify({ type:'voice-id', data:{ id: ws._id } })); } catch {}
+
+  // TRIMITE SNAPSHOT CU CEI DEJA ÎN VOICE
+  try {
+    const list = Array.from(voicePeers, ([id, v]) => ({ id, user: v.user, muted: !!v.muted }));
+    ws.send(JSON.stringify({ type:'voice-state', data: list }));
+  } catch {}
 
   ws.on('message', async buf => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
@@ -379,14 +389,19 @@ wss.on('connection', ws => {
 
     // --- VOICE SIGNALING ---
     if (msg?.type === 'voice-join') {
-      broadcast({ type:'voice-join', data:{ id: ws._id, user: msg.user || '—' } });
+      const user = msg.user || '—';
+      voicePeers.set(ws._id, { user, muted: false });
+      broadcast({ type:'voice-join', data:{ id: ws._id, user } });
       return;
     }
     if (msg?.type === 'voice-leave') {
+      if (voicePeers.has(ws._id)) voicePeers.delete(ws._id);
       broadcast({ type:'voice-leave', data:{ id: ws._id } });
       return;
     }
     if (msg?.type === 'voice-mute') {
+      const row = voicePeers.get(ws._id);
+      if (row) { row.muted = !!msg.muted; voicePeers.set(ws._id, row); }
       broadcast({ type:'voice-mute', data:{ id: ws._id, muted: !!msg.muted } });
       return;
     }
@@ -405,6 +420,11 @@ wss.on('connection', ws => {
   });
 
   ws.on('close', () => {
-    try { broadcast({ type:'voice-leave', data:{ id: ws._id } }); } catch {}
+    try {
+      if (voicePeers.has(ws._id)) {
+        voicePeers.delete(ws._id);
+        broadcast({ type:'voice-leave', data:{ id: ws._id } });
+      }
+    } catch {}
   });
 });
