@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
 
 /* ========= ENV ========= */
 const PORT                 = process.env.PORT || 10000;
@@ -59,12 +60,11 @@ app.use(corsDynamic);
 app.options('*', corsDynamic);
 
 /* ========= XP / LEVEL ========= */
-/* Formulă UNICĂ (quadratic): level = 1 + floor(sqrt(xp / 100)) */
 function levelFromXp(xpInt = 0) {
   const xp = Math.max(0, Math.floor(xpInt));
   const lvl = 1 + Math.floor(Math.sqrt(xp / 100));
-  const prevThreshold = (lvl - 1) * (lvl - 1) * 100; // (L-1)^2 *100
-  const nextThreshold = (lvl) * (lvl) * 100;         // L^2 *100
+  const prevThreshold = (lvl - 1) * (lvl - 1) * 100;
+  const nextThreshold = (lvl) * (lvl) * 100;
   const cur = xp - prevThreshold;
   const next = nextThreshold - prevThreshold;
   const pct = Math.max(0, Math.min(100, Math.round((cur / next) * 100)));
@@ -73,10 +73,10 @@ function levelFromXp(xpInt = 0) {
 
 /* Valori XP pentru evenimente */
 const XP_BY_TYPE = {
-  profile_complete: 50,     // o singură dată (unic pe (user,type))
-  lesson_complete: 40,      // per lecție (unic pe meta.key)
-  quiz_pass: 60,            // per lecție (unic pe meta.key)
-  chat_message: null        // calculat din conținut (8..20)
+  profile_complete: 50,
+  lesson_complete: 40,
+  quiz_pass: 60,
+  chat_message: null
 };
 
 /* Anti-spam chat XP */
@@ -102,7 +102,7 @@ async function readProfileByEmail(email) {
   return data || null;
 }
 
-/* Apel centralizat la RPC add_xp (și sincronizează profiles prin funcția din Punctul C) */
+/* Apel RPC add_xp + sync profiles */
 async function addXp(uid, delta, type, meta = {}) {
   const { data, error } = await supa.rpc('add_xp', {
     uid,
@@ -111,10 +111,8 @@ async function addXp(uid, delta, type, meta = {}) {
     ev_meta: meta
   });
   if (error) {
-    // Dacă e duplicate key (once/perkey), returnăm totalul actual fără a da 500
     const msg = String(error.message || '').toLowerCase();
     if (msg.includes('duplicate') || msg.includes('unique')) {
-      // citesc totalul din user_xp
       const { data: ux } = await supa.from('user_xp').select('xp').eq('user_id', uid).maybeSingle();
       return ux?.xp ?? null;
     }
@@ -122,8 +120,6 @@ async function addXp(uid, delta, type, meta = {}) {
   }
   return data; // new_total XP
 }
-
-/* XP din text (chat) */
 function xpForMessage(text='') {
   const len = String(text).trim().length;
   const base = 8;
@@ -144,13 +140,11 @@ app.get('/healthz', (req, res) => {
 });
 
 /* ---------- XP API ---------- */
-// GET /api/xp/me  (Authorization: Bearer <supabase access token>)
 app.get('/api/xp/me', async (req, res) => {
   try {
     const user = await getUserFromToken(req.headers.authorization || '');
     if (!user) return res.status(401).json({ error: 'unauthorized' });
 
-    // ia totalul din user_xp (sau 0)
     const { data: ux } = await supa.from('user_xp').select('xp').eq('user_id', user.id).maybeSingle();
     const total = ux?.xp || 0;
     const shaped = levelFromXp(total);
@@ -161,7 +155,6 @@ app.get('/api/xp/me', async (req, res) => {
   }
 });
 
-/* POST /api/xp/earn  { token, type, meta }  */
 app.post('/api/xp/earn', async (req, res) => {
   try {
     const { token, type, meta = {} } = req.body || {};
@@ -171,13 +164,11 @@ app.post('/api/xp/earn', async (req, res) => {
     if (!type || !(type in XP_BY_TYPE)) {
       return res.status(400).json({ error: 'bad-type' });
     }
-
-    let delta = XP_BY_TYPE[type];
     if (type === 'chat_message') {
       return res.status(400).json({ error: 'chat-message-via-ws-only' });
     }
 
-    const newTotal = await addXp(user.id, delta, type, meta);
+    const newTotal = await addXp(user.id, XP_BY_TYPE[type], type, meta);
     const shaped   = levelFromXp(newTotal || 0);
     res.json({ ok: true, ...shaped });
   } catch (e) {
@@ -186,7 +177,6 @@ app.post('/api/xp/earn', async (req, res) => {
   }
 });
 
-/* GET /api/xp/leaderboard?period=7d */
 app.get('/api/xp/leaderboard', async (req, res) => {
   try {
     const period = String(req.query.period || 'all').toLowerCase();
@@ -207,7 +197,6 @@ app.get('/api/xp/leaderboard', async (req, res) => {
       })));
     }
 
-    // fallback – perioade (7d, 30d) din xp_events
     const map = { '7d': '7 days', '30d': '30 days', '24h': '24 hours' };
     const span = map[period] || '7 days';
     const since = new Date(Date.now() - (
@@ -222,7 +211,6 @@ app.get('/api/xp/leaderboard', async (req, res) => {
   }
 });
 
-
 /* ---------- Chat API ---------- */
 app.get('/api/history', async (req, res) => {
   try {
@@ -235,7 +223,6 @@ app.get('/api/history', async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // map email -> (name, level)
     const emails = [...new Set((data || []).map(r => r.user).filter(Boolean))];
     const meta = new Map();
     if (emails.length) {
@@ -270,19 +257,17 @@ app.post('/api/send', async (req, res) => {
     const row = {
       room: CHAT_ROOM,
       cid: cid || null,
-      user: String(email || 'Anon').slice(0, 160), // EMAIL în DB
+      user: String(email || 'Anon').slice(0, 160),
       text: String(text || '').slice(0, 4000),
       ts: Number(ts || Date.now())
     };
     const ins = await supa.from('chat_messages').insert(row);
     if (ins.error) return res.status(500).json({ error: ins.error.message });
 
-    // XP via RPC add_xp (cu cooldown pe email)
     let displayName = name || email;
     let displayLevel = 1;
 
     try {
-      // cooldown
       const last = lastXpGrant.get(email) || 0;
       if (Date.now() - last >= XP_COOLDOWN_MS) {
         lastXpGrant.set(email, Date.now());
@@ -311,6 +296,119 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
+/* ---------- AFFILIATE API ---------- */
+/* Helper: generează un cod scurt unic */
+async function genUniqueCode() {
+  for (let i=0;i<6;i++){
+    const candidate = crypto.randomBytes(4).toString('base64url').replace(/[^a-zA-Z0-9]/g,'').slice(0,7);
+    const { data } = await supa.from('affiliate_profiles').select('aff_code').eq('aff_code', candidate).maybeSingle();
+    if (!data) return candidate.toLowerCase();
+  }
+  // fallback determinist (nu se întâmplă)
+  return crypto.randomUUID().slice(0,8);
+}
+
+/* Ensure & return codul de afiliat pt userul autentificat */
+app.get('/api/aff/ensure', async (req, res) => {
+  try{
+    const user = await getUserFromToken(req.headers.authorization || '');
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+
+    // există deja?
+    const { data: existing } = await supa
+      .from('affiliate_profiles')
+      .select('aff_code')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (existing?.aff_code) {
+      return res.json({ aff_code: existing.aff_code });
+    }
+
+    // generează & salvează
+    const code = await genUniqueCode();
+    const ins = await supa.from('affiliate_profiles').insert({
+      user_id: user.id,
+      aff_code: code
+    });
+    if (ins.error) return res.status(500).json({ error: ins.error.message });
+
+    res.json({ aff_code: code });
+  }catch(e){
+    console.error('[aff/ensure]', e?.message || e);
+    res.status(500).json({ error: 'aff-ensure-failed' });
+  }
+});
+
+/* Click tracking de pe landing: ?aff_code=abc&u=<landing-url> */
+app.get('/api/aff/click', async (req, res) => {
+  try{
+    const aff_code = String(req.query.aff_code || '').trim().toLowerCase();
+    const landing_url = String(req.query.u || '');
+    if (!aff_code) return res.status(400).json({ ok:false });
+
+    // sigur există codul
+    const { data: ex } = await supa.from('affiliate_profiles').select('aff_code').eq('aff_code', aff_code).maybeSingle();
+    if (!ex) return res.status(404).json({ ok:false });
+
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
+    const ua = String(req.headers['user-agent'] || '');
+    const ref = String(req.headers['referer'] || '');
+    const day = new Date().toISOString().slice(0,10);
+    const ipHash = crypto.createHash('sha256').update(aff_code + '|' + ip + '|' + ua + '|' + day).digest('hex').slice(0,32);
+
+    // dedup pe zi
+    await supa.from('affiliate_clicks').insert({
+      aff_code, landing_url, referer: ref.slice(0,500), ua: ua.slice(0,400),
+      ip_hash: ipHash, day
+    }).then(()=>{}).catch(()=>{});
+
+    res.json({ ok:true });
+  }catch(e){
+    console.error('[aff/click]', e?.message || e);
+    res.status(200).json({ ok:true }); // nu stric landing-ul dacă dă eroare
+  }
+});
+
+/* Stats publice pt un cod (clicks/leads/sales/revenue) */
+app.get('/api/aff/stats', async (req, res) => {
+  try{
+    const aff_code = String(req.query.aff_code || '').trim().toLowerCase();
+    if (!aff_code) return res.status(400).json({ error:'no-code' });
+
+    // clicks
+    const clicksR = await supa
+      .from('affiliate_clicks')
+      .select('id', { count: 'exact', head: true })
+      .eq('aff_code', aff_code);
+    const clicks = clicksR.count || 0;
+
+    // leads (waitlist_subscribers.ref_by)
+    const leadsR = await supa
+      .from('waitlist_subscribers')
+      .select('id', { count:'exact', head:true })
+      .eq('ref_by', aff_code);
+    const leads = leadsR.count || 0;
+
+    // sales & revenue (affiliate_orders)
+    const salesR = await supa
+      .from('affiliate_orders')
+      .select('commission_eur, amount_eur')
+      .eq('aff_code', aff_code)
+      .eq('status','paid');
+
+    const sales = Array.isArray(salesR.data) ? salesR.data.length : 0;
+    const revenue = Array.isArray(salesR.data)
+      ? Math.round(salesR.data.reduce((s,r)=> s + (Number(r.commission_eur)||0), 0))
+      : 0;
+
+    res.json({ clicks, leads, sales, revenue });
+  }catch(e){
+    console.error('[aff/stats]', e?.message || e);
+    res.status(500).json({ error:'aff-stats-failed' });
+  }
+});
+
 /* ========= WS ========= */
 const server = app.listen(PORT, () => {
   console.log(`[BOOT] Port=${PORT} Room=${CHAT_ROOM}`);
@@ -334,7 +432,7 @@ wss.on('connection', ws => {
   // trimite id-ul pentru voice signaling
   try { ws.send(JSON.stringify({ type:'voice-id', data:{ id: ws._id } })); } catch {}
 
-  // TRIMITE SNAPSHOT CU CEI DEJA ÎN VOICE
+  // SNAPSHOT cu cei deja în voice
   try {
     const list = Array.from(voicePeers, ([id, v]) => ({ id, user: v.user, muted: !!v.muted }));
     ws.send(JSON.stringify({ type:'voice-state', data: list }));
