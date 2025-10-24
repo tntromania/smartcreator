@@ -257,14 +257,20 @@ app.get('/api/aff/click', async (req,res)=>{
     const ipHash = crypto.createHash('sha256').update(aff_code+'|'+ip+'|'+ua+'|'+day).digest('hex').slice(0,32);
 
 const ins = await supa.from('affiliate_clicks').insert({
-  aff_code, landing_url, referer: ref.slice(0,500), ua: ua.slice(0,400),
-  ip_hash: ipHash, day
+  aff_code,
+  landing_url,
+  referer: ref.slice(0,500),
+  ua: ua.slice(0,400),
+  ip_hash: ipHash,
+  day
 });
+
 if (ins.error) {
   console.error('[aff/click] insert failed:', ins.error);
-  return res.status(200).json({ ok:false });
+  return res.status(200).json({ ok:false, err:'insert-failed' });
 }
 return res.json({ ok:true });
+
 
 
     res.json({ ok:true });
