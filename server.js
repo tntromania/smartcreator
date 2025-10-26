@@ -240,41 +240,67 @@ app.get('/api/aff/ensure', async (req,res)=>{
   }catch(e){ console.error('[aff/ensure]', e?.message||e); res.status(500).json({ error:'aff-ensure-failed' }); }
 });
 
-// Track click (?aff_code=xxx&u=<landing-url>)
-app.get('/api/aff/click', async (req,res)=>{
-  try{
-    const aff_code = String(req.query.aff_code||'').trim().toLowerCase();
-    const landing_url = String(req.query.u||'');
-    if (!aff_code) return res.status(400).json({ ok:false });
+// Track click + redirect 302 (sigur)
+app.get('/api/aff/click', async (req, res) => {
+  try {
+    const aff_code = String(req.query.aff_code || '').trim().toLowerCase();
+    const landing_url_raw = String(req.query.u || '').trim();
 
-    const { data: ex } = await supa.from('affiliates').select('aff_code').eq('aff_code', aff_code).maybeSingle();
-    if (!ex) return res.status(404).json({ ok:false });
+    if (!aff_code) return res.status(400).json({ ok: false });
 
-    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
-    const ua = String(req.headers['user-agent']||'');
-    const ref = String(req.headers['referer']||'');
-    const day = new Date().toISOString().slice(0,10);
-    const ipHash = crypto.createHash('sha256').update(aff_code+'|'+ip+'|'+ua+'|'+day).digest('hex').slice(0,32);
+    // validăm codul de afiliat
+    const { data: ex } = await supa
+      .from('affiliates')
+      .select('aff_code')
+      .eq('aff_code', aff_code)
+      .maybeSingle();
+    if (!ex) return res.status(404).json({ ok: false });
 
-const ins = await supa.from('affiliate_clicks').insert({
-  aff_code,
-  landing_url,
-  referer: ref.slice(0,500),
-  ua: ua.slice(0,400),
-  ip_hash: ipHash,
-  day
-});
+    // log click (best-effort — nu blocăm redirectul dacă insertul pică)
+    const ip  = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')
+      .toString().split(',')[0].trim();
+    const ua  = String(req.headers['user-agent'] || '');
+    const ref = String(req.headers['referer'] || '');
+    const day = new Date().toISOString().slice(0, 10);
+    const ipHash = crypto.createHash('sha256')
+      .update(aff_code + '|' + ip + '|' + ua + '|' + day)
+      .digest('hex')
+      .slice(0, 32);
 
-if (ins.error) {
-  console.error('[aff/click] insert failed:', ins.error);
-  return res.status(200).json({ ok:false, err:'insert-failed' });
-}
-return res.json({ ok:true });
+    try {
+      await supa.from('affiliate_clicks').insert({
+        aff_code,
+        landing_url: landing_url_raw,
+        referer: ref.slice(0, 500),
+        ua: ua.slice(0, 400),
+        ip_hash: ipHash,
+        day
+      });
+    } catch (err) {
+      console.error('[aff/click] insert failed:', err);
+      // continuăm oricum redirectul
+    }
 
+    // construim destinația de redirect (whitelist domenii)
+    const FALLBACK = 'https://smartcreator.ro/';
+    const allowedHosts = new Set(['smartcreator.ro', 'www.smartcreator.ro']);
+    let dest = FALLBACK;
 
+    try {
+      const u = new URL(landing_url_raw || FALLBACK);
+      if (!allowedHosts.has(u.hostname)) throw new Error('host-not-allowed');
+      if (!u.searchParams.get('ref')) u.searchParams.set('ref', aff_code);
+      dest = u.toString();
+    } catch (_) {
+      // rămânem pe FALLBACK
+    }
 
-    res.json({ ok:true });
-  }catch(e){ console.error('[aff/click]', e?.message||e); res.status(200).json({ ok:true }); }
+    res.setHeader('Cache-Control', 'no-store');
+    return res.redirect(302, dest);
+  } catch (e) {
+    console.error('[aff/click]', e?.message || e);
+    return res.redirect(302, 'https://smartcreator.ro/');
+  }
 });
 
 // Stats publice (clicks/leads/sales/revenue). LEADS pe tabela ta "waitlist".
