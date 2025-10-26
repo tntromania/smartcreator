@@ -11,11 +11,6 @@ const SUPABASE_URL         = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const CHAT_ROOM            = process.env.CHAT_ROOM || 'global';
 
-/* CORS */
-const CORS_ORIGIN = (process.env.CORS_ORIGIN || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
-const ALLOW_NULL_ORIGIN = String(process.env.ALLOW_NULL_ORIGIN ?? '1').trim() === '1';
-
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('[FATAL] Lipsesc SUPABASE_URL / SUPABASE_SERVICE_KEY');
   process.exit(1);
@@ -25,6 +20,11 @@ const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const app = express();
 app.use(express.json({ limit: '512kb' }));
+
+/* ========= CORS ========= */
+const CORS_ORIGIN = (process.env.CORS_ORIGIN || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const ALLOW_NULL_ORIGIN = String(process.env.ALLOW_NULL_ORIGIN ?? '1').trim() === '1';
 
 function isAllowedOrigin(origin) {
   if (!origin) return true;
@@ -54,20 +54,40 @@ app.use(corsDynamic);
 app.options('*', corsDynamic);
 
 /* ========= XP / LEVEL ========= */
+/** Bază de nivel mai „greu”: 150 (poți modifica prin ENV LEVEL_BASE=...) */
+const LEVEL_BASE = Number(process.env.LEVEL_BASE || 130);
+
 function levelFromXp(xpInt = 0) {
+  const B = LEVEL_BASE;
   const xp = Math.max(0, Math.floor(xpInt));
-  const lvl = 1 + Math.floor(Math.sqrt(xp / 100));
-  const prevThreshold = (lvl - 1) * (lvl - 1) * 100;
-  const nextThreshold = (lvl) * (lvl) * 100;
+  const lvl = 1 + Math.floor(Math.sqrt(xp / B));
+  const prevThreshold = (lvl - 1) * (lvl - 1) * B;
+  const nextThreshold = (lvl) * (lvl) * B;
   const cur = xp - prevThreshold;
   const next = nextThreshold - prevThreshold;
-  const pct = Math.max(0, Math.min(100, Math.round((cur / next) * 100)));
-  return { level: lvl, cur, next, total: xp, pct, prevThreshold, nextThreshold };
+  const pct = Math.max(0, Math.min(100, Math.round((cur / Math.max(1, next)) * 100)));
+  return { level: lvl, cur, next, total: xp, pct, prevThreshold, nextThreshold, base: B };
 }
-const XP_BY_TYPE = { profile_complete:50, lesson_complete:40, quiz_pass:60, chat_message:null };
-const XP_COOLDOWN_MS = 15_000;
-const lastXpGrant = new Map();
 
+/** XP pe acțiuni (tunat) */
+const XP_BY_TYPE = {
+  profile_complete: 20,
+  lesson_complete: 15,
+  quiz_pass: 25,
+  chat_message: null, // doar prin WS / /api/send
+};
+
+const XP_COOLDOWN_MS = 15_000; // 15s între granturi de chat pentru același user (există deja)
+const lastXpGrant = new Map();  // email -> last_ts
+
+/** CAP zilnic pentru chat */
+const CHAT_XP_CAP_PER_DAY   = 120; // XP maxim din chat / zi / user
+const CHAT_MSG_CAP_PER_DAY  = 40;  // mesaje/zi care pot da XP
+const chatDaily             = new Map(); // cheie "email|YYYY-MM-DD" -> { xp, count }
+const dayOf                 = () => new Date().toISOString().slice(0,10);
+const chatKey               = (email) => `${String(email||'Anon').toLowerCase()}|${dayOf()}`;
+
+/** Helpers Supabase */
 async function getUserFromToken(bearerOrRaw){
   const token = (bearerOrRaw || '').replace(/^Bearer\s+/i,'').trim();
   if (!token) return null;
@@ -96,16 +116,39 @@ async function addXp(uid, delta, type, meta={}){
   }
   return data;
 }
+
+/** Calculează XP per mesaj: 2–6 XP, cu mic bonus pe mesaje mai lungi */
 function xpForMessage(text=''){
   const len = String(text).trim().length;
-  const base = 8;
-  const bonus = Math.floor(Math.max(0, len - 120) / 120);
-  return Math.min(base + bonus, 20);
+  const base = 2;
+  const bonus = Math.floor(Math.max(0, len - 160) / 180);
+  return Math.min(base + bonus, 6);
+}
+
+/** Aplică cap-ul zilnic pentru chat; returnează cât XP e „allowable” din `inc` */
+function canGrantChatXp(email, inc){
+  const k = chatKey(email);
+  const row = chatDaily.get(k) || { xp: 0, count: 0 };
+  if (row.xp >= CHAT_XP_CAP_PER_DAY || row.count >= CHAT_MSG_CAP_PER_DAY) return 0;
+  const allowed = Math.max(0, Math.min(inc, CHAT_XP_CAP_PER_DAY - row.xp));
+  row.xp += allowed;
+  row.count += 1;
+  chatDaily.set(k, row);
+  return allowed;
 }
 
 /* ================== ROUTES ================== */
 app.get('/healthz', (req,res)=>{
-  res.json({ ok:true, room:CHAT_ROOM, cors:CORS_ORIGIN.length?CORS_ORIGIN:'(all)', allow_null_origin:ALLOW_NULL_ORIGIN, supa_url:!!SUPABASE_URL, service_key:!!SUPABASE_SERVICE_KEY });
+  res.json({
+    ok:true,
+    room:CHAT_ROOM,
+    cors:CORS_ORIGIN.length?CORS_ORIGIN:'(all)',
+    allow_null_origin:ALLOW_NULL_ORIGIN,
+    supa_url:!!SUPABASE_URL,
+    service_key:!!SUPABASE_SERVICE_KEY,
+    level_base: LEVEL_BASE,
+    chat_caps: { CHAT_XP_CAP_PER_DAY, CHAT_MSG_CAP_PER_DAY }
+  });
 });
 
 /* ---------- XP API ---------- */
@@ -139,7 +182,12 @@ app.get('/api/xp/leaderboard', async (req,res)=>{
         .order('xp', { ascending:false })
         .limit(20);
       if (error) throw error;
-      return res.json((data||[]).map(r=>({ user_id:r.user_id, full_name:r.full_name || (r.email?r.email.split('@')[0]:'User'), email:r.email, xp:Math.max(0, r.xp||0) })));
+      return res.json((data||[]).map(r=>({
+        user_id:r.user_id,
+        full_name:r.full_name || (r.email?r.email.split('@')[0]:'User'),
+        email:r.email,
+        xp:Math.max(0, r.xp||0)
+      })));
     }
     const map = { '7d':'7 days', '30d':'30 days', '24h':'24 hours' };
     const span = map[period] || '7 days';
@@ -176,10 +224,17 @@ app.get('/api/history', async (req,res)=>{
     res.json(shaped);
   }catch(e){ console.error('[history]', e); res.status(500).json({ error:'history-failed' }); }
 });
+
 app.post('/api/send', async (req,res)=>{
   try{
     const { user: email, name, text, cid, ts } = req.body || {};
-    const row = { room:CHAT_ROOM, cid:cid||null, user:String(email||'Anon').slice(0,160), text:String(text||'').slice(0,4000), ts:Number(ts||Date.now()) };
+    const row = {
+      room:CHAT_ROOM,
+      cid:cid||null,
+      user:String(email||'Anon').slice(0,160),
+      text:String(text||'').slice(0,4000),
+      ts:Number(ts||Date.now())
+    };
     const ins = await supa.from('chat_messages').insert(row);
     if (ins.error) return res.status(500).json({ error:ins.error.message });
 
@@ -191,11 +246,17 @@ app.post('/api/send', async (req,res)=>{
         lastXpGrant.set(email, Date.now());
         const prof = await readProfileByEmail(email);
         if (prof?.user_id){
-          const inc = xpForMessage(text);
-          const total = await addXp(prof.user_id, inc, 'chat_message', { cid:cid||null });
-          const shaped = levelFromXp(total||0);
-          displayLevel = shaped.level;
-          displayName  = prof.full_name || email;
+          const rawInc = xpForMessage(text);
+          const inc    = canGrantChatXp(email, rawInc);
+          if (inc > 0) {
+            const total  = await addXp(prof.user_id, inc, 'chat_message', { cid:cid||null });
+            const shaped = levelFromXp(total||0);
+            displayLevel = shaped.level;
+            displayName  = prof.full_name || email;
+          } else {
+            displayLevel = prof?.level || 1;
+            displayName  = prof?.full_name || email;
+          }
         }
       } else {
         const prof = await readProfileByEmail(email);
@@ -209,8 +270,8 @@ app.post('/api/send', async (req,res)=>{
   }catch(e){ console.error('[send]', e); res.status(500).json({ error:'send-failed' }); }
 });
 
-/* ---------- AFFILIATE API (fix nume tabele) ---------- */
-// Folosește tabelul TAU: "affiliates" (user_id UNIQUE, aff_code UNIQUE)
+/* ---------- AFFILIATE API ---------- */
+// Folosește tabelul tău: "affiliates" (user_id UNIQUE, aff_code UNIQUE)
 async function genUniqueCode(){
   for (let i=0;i<6;i++){
     const c = crypto.randomBytes(4).toString('base64url').replace(/[^a-zA-Z0-9]/g,'').slice(0,7);
@@ -240,7 +301,7 @@ app.get('/api/aff/ensure', async (req,res)=>{
   }catch(e){ console.error('[aff/ensure]', e?.message||e); res.status(500).json({ error:'aff-ensure-failed' }); }
 });
 
-// Track click + redirect 302 (sigur)
+// Track click + redirect 302
 app.get('/api/aff/click', async (req, res) => {
   try {
     const aff_code = String(req.query.aff_code || '').trim().toLowerCase();
@@ -248,7 +309,6 @@ app.get('/api/aff/click', async (req, res) => {
 
     if (!aff_code) return res.status(400).json({ ok: false });
 
-    // validăm codul de afiliat
     const { data: ex } = await supa
       .from('affiliates')
       .select('aff_code')
@@ -256,7 +316,6 @@ app.get('/api/aff/click', async (req, res) => {
       .maybeSingle();
     if (!ex) return res.status(404).json({ ok: false });
 
-    // log click (best-effort — nu blocăm redirectul dacă insertul pică)
     const ip  = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')
       .toString().split(',')[0].trim();
     const ua  = String(req.headers['user-agent'] || '');
@@ -278,10 +337,8 @@ app.get('/api/aff/click', async (req, res) => {
       });
     } catch (err) {
       console.error('[aff/click] insert failed:', err);
-      // continuăm oricum redirectul
     }
 
-    // construim destinația de redirect (whitelist domenii)
     const FALLBACK = 'https://smartcreator.ro/';
     const allowedHosts = new Set(['smartcreator.ro', 'www.smartcreator.ro']);
     let dest = FALLBACK;
@@ -303,17 +360,21 @@ app.get('/api/aff/click', async (req, res) => {
   }
 });
 
-// Stats publice (clicks/leads/sales/revenue). LEADS pe tabela ta "waitlist".
+// Stats publice (clicks/leads/sales/revenue).
 app.get('/api/aff/stats', async (req,res)=>{
   try{
     const aff_code = String(req.query.aff_code||'').trim().toLowerCase();
     if (!aff_code) return res.status(400).json({ error:'no-code' });
 
-    const clicksR = await supa.from('affiliate_clicks').select('id',{ count:'exact', head:true }).eq('aff_code', aff_code);
+    const clicksR = await supa.from('affiliate_clicks')
+      .select('id',{ count:'exact', head:true })
+      .eq('aff_code', aff_code);
     const clicks  = clicksR.count || 0;
 
-    // !!! dacă pe landing bagi în "waitlist_subscribers", schimbă aici numele.
-    const leadsR  = await supa.from('waitlist').select('id',{ count:'exact', head:true }).eq('ref_by', aff_code);
+    // dacă pe landing bagi în altă tabelă, schimbă aici
+    const leadsR  = await supa.from('waitlist')
+      .select('id',{ count:'exact', head:true })
+      .eq('ref_by', aff_code);
     const leads   = leadsR.count || 0;
 
     const salesR = await supa
@@ -335,13 +396,17 @@ const server = app.listen(PORT, ()=>{
   console.log(`[BOOT] Port=${PORT} Room=${CHAT_ROOM}`);
   console.log(`[BOOT] CORS:`, CORS_ORIGIN.length?CORS_ORIGIN:'(all)');
   console.log(`[BOOT] Allow Origin "null":`, ALLOW_NULL_ORIGIN);
+  console.log(`[BOOT] Level base: ${LEVEL_BASE} | Chat caps: ${CHAT_XP_CAP_PER_DAY} XP/zi, ${CHAT_MSG_CAP_PER_DAY} mesaje/zi`);
 });
 const wss = new WebSocketServer({ server });
+
 function broadcast(obj){
   const msg = JSON.stringify(obj);
   wss.clients.forEach(c=>{ try{ if (c.readyState===1) c.send(msg); }catch{} });
 }
+
 const voicePeers = new Map();
+
 wss.on('connection', ws=>{
   ws._id = Math.random().toString(16).slice(2);
   try{ ws.send(JSON.stringify({ type:'voice-id', data:{ id:ws._id } })); }catch{}
@@ -367,11 +432,17 @@ wss.on('connection', ws=>{
           lastXpGrant.set(email, Date.now());
           const prof = await readProfileByEmail(email);
           if (prof?.user_id){
-            const inc = xpForMessage(row.text);
-            const total = await addXp(prof.user_id, inc, 'chat_message', { cid:row.cid||null });
-            const shaped = levelFromXp(total||0);
-            displayLevel = shaped.level;
-            displayName  = prof.full_name || email;
+            const rawInc = xpForMessage(row.text);
+            const inc    = canGrantChatXp(email, rawInc);
+            if (inc > 0){
+              const total  = await addXp(prof.user_id, inc, 'chat_message', { cid:row.cid||null });
+              const shaped = levelFromXp(total||0);
+              displayLevel = shaped.level;
+              displayName  = prof.full_name || email;
+            } else {
+              displayLevel = prof?.level || 1;
+              displayName  = prof?.full_name || email;
+            }
           }
         } else {
           const prof = await readProfileByEmail(email);
