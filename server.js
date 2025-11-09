@@ -23,10 +23,69 @@ const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const app = express();
 app.use(express.json({ limit: '512kb' }));
 
-/* ========= CORS ========= */
-const CORS_ORIGIN = (process.env.CORS_ORIGIN || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+/* ========= CORS (robust, cu wildcard) ========= */
+// Dacă nu setezi CORS_ORIGIN în env, folosește lista implicită de mai jos.
+const DEFAULT_ALLOW_ORIGINS = [
+  'https://smartcreator.ro',
+  'https://www.smartcreator.ro',
+  'http://localhost:5173',
+  '*.netlify.app',
+];
+
+const RAW_ALLOW = (process.env.CORS_ORIGIN && process.env.CORS_ORIGIN.trim().length
+  ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean)
+  : DEFAULT_ALLOW_ORIGINS
+);
+
+// Permite sau nu origini "null" (ex: request-uri din extensii, file://, SW)
 const ALLOW_NULL_ORIGIN = String(process.env.ALLOW_NULL_ORIGIN ?? '1').trim() === '1';
+
+function originAllowed(origin) {
+  // fără Origin (ex: curl/Postman/SW) — tratează ca "null"
+  if (!origin || origin === 'null') return ALLOW_NULL_ORIGIN;
+
+  let host = '';
+  try { host = new URL(origin).hostname; } catch { return false; }
+
+  return RAW_ALLOW.some(patRaw => {
+    // Acceptă atât URL-uri complete, cât și hostname/wildcard
+    let pat = patRaw;
+    try { pat = new URL(patRaw).hostname; } catch {} // dacă e URL, extrage hostname
+
+    if (!pat) return false;
+    if (pat === '*') return true;
+    if (pat.startsWith('*.')) {
+      // ex: *.netlify.app -> match pe subdomenii și pe exact netlify.app
+      return host === pat.slice(2) || host.endsWith(pat.slice(1));
+    }
+    if (pat.startsWith('*')) {
+      // ex: *netlify.app
+      return host.endsWith(pat.slice(1));
+    }
+    // match exact
+    return host === pat;
+  });
+}
+
+const corsOpts = {
+  origin(origin, cb) {
+    if (originAllowed(origin)) return cb(null, true);
+    console.warn('[CORS] blocked:', origin, 'allowed =', RAW_ALLOW);
+    return cb(new Error('CORS blocked'), false);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400, // cache pentru preflight
+};
+
+// Ajută la cache corect pe CDN/proxy (ca să nu “piardă” headerul CORS)
+app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
+
+// Activează CORS global + preflight pentru toate rutele
+app.use(cors(corsOpts));
+app.options('*', cors(corsOpts));
+
 
 /* ========= PUSH NOTIFICATIONS ========= */
 // Configurează VAPID Keys - CHEILE TALE REALE
@@ -46,7 +105,7 @@ webpush.setVapidDetails(
 let pushSubscriptions = [];
 
 // POST /api/push/subscribe — primește subscription-ul din browser
-app.post('/api/push/subscribe', async (req, res) => {
+app.post('/api/push/subscribe', corsDynamic, async (req, res) => {
   try {
     const { subscription, user } = req.body || {};
     
@@ -128,7 +187,7 @@ async function loadPushSubscriptions() {
 }
 
 // POST /api/push/send - Trimite notificări push
-app.post('/api/push/send', async (req, res) => {
+app.post('/api/push/send', corsDynamic, async (req, res) => {
   try {
     const { title, body, image, url } = req.body;
     const authToken = req.headers.authorization?.replace('Bearer ', '');
@@ -205,34 +264,6 @@ app.post('/api/push/send', async (req, res) => {
 loadPushSubscriptions().then(() => {
   console.log(`[PUSH] Subscription-uri încărcate: ${pushSubscriptions.length}`);
 });
-
-
-function isAllowedOrigin(origin) {
-  if (!origin) return true;
-  if (origin === 'null') return ALLOW_NULL_ORIGIN || CORS_ORIGIN.includes('*') || CORS_ORIGIN.includes('null');
-  if (!CORS_ORIGIN.length) return true;
-  if (CORS_ORIGIN.includes('*')) return true;
-
-  let host = '';
-  try { host = new URL(origin).hostname; } catch { return false; }
-
-  return CORS_ORIGIN.some(p => {
-    try { p = new URL(p).hostname; } catch {}
-    if (!p) return false;
-    if (p === host) return true;
-    if (p.startsWith('*.')) return host === p.slice(2) || host.endsWith(p.slice(1));
-    if (p.startsWith('*'))  return host.endsWith(p.slice(1));
-    return false;
-  });
-}
-const corsDynamic = cors({
-  origin(origin, cb){ isAllowedOrigin(origin) ? cb(null,true) : cb(new Error('CORS blocked: ' + origin)); },
-  credentials:true,
-  methods:['GET','POST','OPTIONS'],
-  allowedHeaders:['Content-Type','Authorization']
-});
-app.use(corsDynamic);
-app.options('*', corsDynamic);
 
 /* ========= XP / LEVEL ========= */
 /** Bază de nivel mai „greu”: 150 (poți modifica prin ENV LEVEL_BASE=...) */
@@ -532,7 +563,7 @@ app.get('/api/notifications/recent', async (req, res) => {
 
 
 // Endpoint pentru listarea subscription-urilor (doar admin)
-app.get('/api/push/subscriptions', async (req, res) => {
+app.get('/api/push/subscriptions', corsDynamic, async (req, res) => {
   const authToken = req.headers.authorization?.replace('Bearer ', '');
   const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'smartcreator_admin_2025';
   
