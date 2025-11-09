@@ -173,7 +173,7 @@ app.post('/api/push/send', async (req, res) => {
             try {
               await supa.from('push_subscriptions')
                 .delete()
-                .eq('subscription->>endpoint', sub.subscription.endpoint);
+                .filter('subscription->>endpoint', 'eq', sub.subscription.endpoint);
             } catch (dbError) {
               console.error('Eroare ștergere subscription:', dbError);
             }
@@ -459,8 +459,8 @@ app.post('/api/notifications/send-global', async (req, res) => {
     const { title, message, type } = req.body;
     const authToken = req.headers.authorization?.replace('Bearer ', '');
 
-    // Verifică token-ul de admin
-    if (authToken !== process.env.ADMIN_TOKEN) {
+    const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'smartcreator_admin_2025';
+    if (authToken !== ADMIN_TOKEN) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -534,9 +534,10 @@ app.get('/api/notifications/recent', async (req, res) => {
 // Endpoint pentru listarea subscription-urilor (doar admin)
 app.get('/api/push/subscriptions', async (req, res) => {
   const authToken = req.headers.authorization?.replace('Bearer ', '');
+  const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'smartcreator_admin_2025';
   
-  if (authToken !== process.env.ADMIN_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  if (authToken !== ADMIN_TOKEN) {
+     return res.status(401).json({ error: 'Unauthorized' });
   }
 
   res.json({
