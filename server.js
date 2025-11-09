@@ -104,6 +104,44 @@ async function loadPushSubscriptions() {
     console.error('Eroare încărcare subscriptions:', error);
   }
 }
+// === Helper: trimite push la toți + cleanup subs invalide ===
+async function sendToAll(subscriptions, payload) {
+  const body = JSON.stringify({
+    title: payload.title,
+    body:  payload.body,
+    url:   payload.url,
+    image: payload.image,
+    tag:   payload.tag || 'smartcreator-update'
+  });
+
+  const results = await Promise.all(subscriptions.map(async (sub) => {
+    try {
+      await webpush.sendNotification(sub, body);
+      return { ok: true, endpoint: sub.endpoint };
+    } catch (e) {
+      return { ok: false, status: e.statusCode, endpoint: sub.endpoint };
+    }
+  }));
+
+  // Curățare subs invalide (410/404) din memorie + din Supabase
+  const bad = results.filter(r => !r.ok && (r.status === 404 || r.status === 410));
+  if (bad.length) {
+    const badSet = new Set(bad.map(b => b.endpoint));
+    // memorie
+    pushSubscriptions = pushSubscriptions.filter(s => !badSet.has(s.subscription?.endpoint));
+    // DB
+    for (const b of bad) {
+      try {
+        await supa.from('push_subscriptions')
+          .delete()
+          .eq('subscription->>endpoint', b.endpoint);
+      } catch {}
+    }
+  }
+
+  return results;
+}
+
 
 function isAllowedOrigin(origin) {
   if (!origin) return true;
