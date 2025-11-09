@@ -1,4 +1,5 @@
 // server.js
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
@@ -28,41 +29,62 @@ const CORS_ORIGIN = (process.env.CORS_ORIGIN || '')
 const ALLOW_NULL_ORIGIN = String(process.env.ALLOW_NULL_ORIGIN ?? '1').trim() === '1';
 
 /* ========= PUSH NOTIFICATIONS ========= */
-// Configurează VAPID Keys - vor fi setate prin variabile de mediu
+// Configurează VAPID Keys - CHEILE TALE REALE
+const VAPID_PUBLIC_KEY = 'BMWwOJ3Zu2Py2zpcp2w0Bb29fiuv0RjOtspRbBoXh_0HxlE_GNgIFrsBiiC02oKzjIDI3dexYPhvkPkkBy7Rq_w';
+const VAPID_PRIVATE_KEY = 'zSXJ8rxqL6R21CPlNJsMYMk2JMpWkeHdOAhdmV36Eiw';
+
+console.log('🔑 VAPID Public Key:', VAPID_PUBLIC_KEY);
+console.log('🔐 VAPID Private Key loaded:', VAPID_PRIVATE_KEY ? '✅' : '❌');
+
 webpush.setVapidDetails(
   'mailto:contact@smartcreator.ro',
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY
+  VAPID_PUBLIC_KEY,    // Aceeași cheie publică ca în frontend
+  VAPID_PRIVATE_KEY    // Cheia ta privată
 );
-
-// POST /api/push/subscribe  — primește subscription-ul din browser
-app.post('/api/push/subscribe', async (req, res) => {
-  try {
-    const { subscription, user } = req.body || {};
-    if (!subscription || !subscription.endpoint) {
-      return res.status(400).json({ error: 'bad-subscription' });
-    }
-
-    // salvează în DB dacă ai funcția; altfel păstrează în memorie
-    try {
-      await savePushSubscription(subscription, user || {});
-    } catch (e) {
-      console.warn('savePushSubscription failed, keeping in memory:', e?.message || e);
-      pushSubscriptions = pushSubscriptions.filter(s => s.subscription?.endpoint !== subscription.endpoint);
-      pushSubscriptions.push({ subscription, user, timestamp: new Date() });
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('subscribe error:', e?.message || e);
-    res.status(500).json({ error: 'subscribe-failed' });
-  }
-});
 
 // Stocare subscription-uri push (în memorie - pentru început)
 let pushSubscriptions = [];
 
-// Funcție pentru a salva subscription-urile în Supabase (opțional)
+// POST /api/push/subscribe — primește subscription-ul din browser
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const { subscription, user } = req.body || {};
+    
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ error: 'bad-subscription' });
+    }
+
+    console.log('📝 New push subscription from:', user?.email || 'unknown');
+    console.log('🔗 Endpoint:', subscription.endpoint?.slice(0, 80) + '...');
+
+    // Salvează în memorie
+    pushSubscriptions = pushSubscriptions.filter(sub => 
+      sub.subscription?.endpoint !== subscription.endpoint
+    );
+    
+    pushSubscriptions.push({ 
+      subscription, 
+      user, 
+      timestamp: new Date() 
+    });
+
+    // Încearcă să salvezi și în Supabase
+    try {
+      await savePushSubscription(subscription, user || {});
+    } catch (e) {
+      console.warn('Supabase save failed, keeping in memory:', e?.message);
+    }
+
+    console.log(`✅ Total subscriptions: ${pushSubscriptions.length}`);
+    return res.json({ ok: true, message: 'Subscribed to push notifications' });
+    
+  } catch (e) {
+    console.error('❌ subscribe error:', e);
+    res.status(500).json({ error: 'subscribe-failed' });
+  }
+});
+
+// Funcție pentru a salva subscription-urile în Supabase
 async function savePushSubscription(subscription, user = {}) {
   try {
     const { data, error } = await supa
@@ -79,8 +101,7 @@ async function savePushSubscription(subscription, user = {}) {
     return data;
   } catch (error) {
     console.error('Eroare salvare subscription:', error);
-    // Fallback la stocarea în memorie
-    pushSubscriptions.push({ subscription, user, timestamp: new Date() });
+    throw error; // Re-throw pentru a fi prins în funcția apelantă
   }
 }
 
@@ -99,48 +120,91 @@ async function loadPushSubscriptions() {
         user: { email: row.user_email, id: row.user_id },
         timestamp: new Date(row.created_at)
       }));
+      console.log(`📥 Loaded ${pushSubscriptions.length} subscriptions from Supabase`);
     }
   } catch (error) {
     console.error('Eroare încărcare subscriptions:', error);
   }
 }
-// === Helper: trimite push la toți + cleanup subs invalide ===
-async function sendToAll(subscriptions, payload) {
-  const body = JSON.stringify({
-    title: payload.title,
-    body:  payload.body,
-    url:   payload.url,
-    image: payload.image,
-    tag:   payload.tag || 'smartcreator-update'
-  });
 
-  const results = await Promise.all(subscriptions.map(async (sub) => {
-    try {
-      await webpush.sendNotification(sub, body);
-      return { ok: true, endpoint: sub.endpoint };
-    } catch (e) {
-      return { ok: false, status: e.statusCode, endpoint: sub.endpoint };
-    }
-  }));
+// POST /api/push/send - Trimite notificări push
+app.post('/api/push/send', async (req, res) => {
+  try {
+    const { title, body, image, url } = req.body;
+    const authToken = req.headers.authorization?.replace('Bearer ', '');
 
-  // Curățare subs invalide (410/404) din memorie + din Supabase
-  const bad = results.filter(r => !r.ok && (r.status === 404 || r.status === 410));
-  if (bad.length) {
-    const badSet = new Set(bad.map(b => b.endpoint));
-    // memorie
-    pushSubscriptions = pushSubscriptions.filter(s => !badSet.has(s.subscription?.endpoint));
-    // DB
-    for (const b of bad) {
-      try {
-        await supa.from('push_subscriptions')
-          .delete()
-          .eq('subscription->>endpoint', b.endpoint);
-      } catch {}
+    // Verifică token-ul de admin
+    const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'smartcreator_admin_2025';
+    if (authToken !== ADMIN_TOKEN) {
+      console.log('❌ Unauthorized push attempt with token:', authToken?.slice(0, 10) + '...');
+      return res.status(401).json({ error: 'Unauthorized' });
     }
+
+    if (!title || !body) {
+      return res.status(400).json({ error: 'Title and body required' });
+    }
+
+    console.log(`📢 Sending push to ${pushSubscriptions.length} users:`, title);
+
+    const payload = JSON.stringify({
+      title: title,
+      body: body,
+      image: image,
+      url: url || 'https://smartcreator.ro/#sec-changelog',
+      icon: 'https://smartcreator.ro/logo3.png',
+      badge: 'https://smartcreator.ro/logo3.png',
+      tag: 'update-' + Date.now()
+    });
+
+    // Trimite tuturor
+    const results = await Promise.all(
+      pushSubscriptions.map(async (sub, index) => {
+        try {
+          await webpush.sendNotification(sub.subscription, payload);
+          console.log(`✅ Sent to ${index + 1}/${pushSubscriptions.length}`);
+          return { success: true, index };
+        } catch (error) {
+          console.log(`❌ Failed ${index + 1}:`, error.statusCode);
+          
+          // Șterge subscription-uri invalide
+          if (error.statusCode === 410 || error.statusCode === 404) {
+            pushSubscriptions = pushSubscriptions.filter(s => s !== sub);
+            // Șterge și din Supabase
+            try {
+              await supa.from('push_subscriptions')
+                .delete()
+                .eq('subscription->>endpoint', sub.subscription.endpoint);
+            } catch (dbError) {
+              console.error('Eroare ștergere subscription:', dbError);
+            }
+          }
+          return { success: false, index, error: error.message };
+        }
+      })
+    );
+
+    const successful = results.filter(r => r.success).length;
+    
+    console.log(`🎯 Push results: ${successful}/${results.length} successful`);
+    
+    res.json({ 
+      success: true, 
+      sent: successful, 
+      total: results.length,
+      failed: results.length - successful,
+      message: `Notificare trimisă la ${successful} utilizatori`
+    });
+
+  } catch (error) {
+    console.error('❌ Eroare send push:', error);
+    res.status(500).json({ error: error.message });
   }
+});
 
-  return results;
-}
+// Încarcă subscription-urile la pornire
+loadPushSubscriptions().then(() => {
+  console.log(`[PUSH] Subscription-uri încărcate: ${pushSubscriptions.length}`);
+});
 
 
 function isAllowedOrigin(origin) {
