@@ -83,8 +83,13 @@ const corsOpts = {
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 
 // Activează CORS global + preflight pentru toate rutele
-app.use(cors(corsOpts));
-app.options('*', cors(corsOpts));
+const corsDynamic = cors(corsOpts);
+app.use(corsDynamic);
+app.options('*', corsDynamic);
+app.options('/api/push/subscribe', corsDynamic);
+app.options('/api/push/send', corsDynamic);
+app.options('/api/push/subscriptions', corsDynamic);
+
 
 
 /* ========= PUSH NOTIFICATIONS ========= */
@@ -354,7 +359,7 @@ app.get('/healthz', (req,res)=>{
   res.json({
     ok:true,
     room:CHAT_ROOM,
-    cors:CORS_ORIGIN.length?CORS_ORIGIN:'(all)',
+    cors: RAW_ALLOW,
     allow_null_origin:ALLOW_NULL_ORIGIN,
     supa_url:!!SUPABASE_URL,
     service_key:!!SUPABASE_SERVICE_KEY,
@@ -707,7 +712,7 @@ loadPushSubscriptions().then(() => {
 /* ========= WS ========= */
 const server = app.listen(PORT, ()=>{
   console.log(`[BOOT] Port=${PORT} Room=${CHAT_ROOM}`);
-  console.log(`[BOOT] CORS:`, CORS_ORIGIN.length?CORS_ORIGIN:'(all)');
+  console.log(`[BOOT] CORS:`, RAW_ALLOW.length ? RAW_ALLOW : '(all)');
   console.log(`[BOOT] Allow Origin "null":`, ALLOW_NULL_ORIGIN);
   console.log(`[BOOT] Level base: ${LEVEL_BASE} | Chat caps: ${CHAT_XP_CAP_PER_DAY} XP/zi, ${CHAT_MSG_CAP_PER_DAY} mesaje/zi`);
 });
