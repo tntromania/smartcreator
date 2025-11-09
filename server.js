@@ -30,7 +30,7 @@ const ALLOW_NULL_ORIGIN = String(process.env.ALLOW_NULL_ORIGIN ?? '1').trim() ==
 /* ========= PUSH NOTIFICATIONS ========= */
 // Configurează VAPID Keys - vor fi setate prin variabile de mediu
 webpush.setVapidDetails(
-  'mailto:alexcaba2000z4@gmail.com',
+  'mailto:contact@smartcreator.ro',
   process.env.VAPID_PUBLIC_KEY,
   process.env.VAPID_PRIVATE_KEY
 );
@@ -327,31 +327,80 @@ app.post('/api/send', async (req,res)=>{
 
 /* ---------- AFFILIATE API ---------- */
 // Folosește tabelul tău: "affiliates" (user_id UNIQUE, aff_code UNIQUE)
-/* ---------- PUSH NOTIFICATIONS API ---------- */
-
-// Endpoint pentru abonare notificări
-app.post('/api/push/subscribe', async (req, res) => {
+/* ========= GLOBAL NOTIFICATIONS ========= */
+app.post('/api/notifications/send-global', async (req, res) => {
   try {
-    const { subscription, user } = req.body;
-    
-    if (!subscription) {
-      return res.status(400).json({ error: 'Subscription required' });
+    const { title, message, type } = req.body;
+    const authToken = req.headers.authorization?.replace('Bearer ', '');
+
+    // Verifică token-ul de admin
+    if (authToken !== process.env.ADMIN_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Verifică dacă subscription-ul există deja
-    const exists = pushSubscriptions.some(sub => 
-      sub.subscription.endpoint === subscription.endpoint
-    );
-
-    if (!exists) {
-      await savePushSubscription(subscription, user);
-      console.log(`✅ Subscription push adăugat. Total: ${pushSubscriptions.length}`);
+    if (!title || !message) {
+      return res.status(400).json({ error: 'Title and message required' });
     }
 
-    res.json({ success: true, total: pushSubscriptions.length });
+    const notification = {
+      id: Date.now(),
+      title,
+      message,
+      type: type || 'info',
+      timestamp: Date.now(),
+      expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 de ore
+    };
+
+    console.log(`📢 Notificare globală: "${title}"`);
+
+    // Broadcast la toți clienții WebSocket conectați
+    broadcast({
+      type: 'global-notification',
+      data: notification
+    });
+
+    // Salvează în baza de date pentru utilizatorii care se conectează mai târziu
+    try {
+      await supa
+        .from('global_notifications')
+        .insert({
+          title,
+          message,
+          type: type || 'info',
+          expires_at: new Date(notification.expiresAt).toISOString()
+        });
+    } catch (dbError) {
+      console.error('Eroare salvare notificare:', dbError);
+    }
+
+    res.json({
+      success: true,
+      message: `Notificare trimisă la ${wss.clients.size} utilizatori conectați`,
+      notification
+    });
+
   } catch (error) {
-    console.error('❌ Eroare subscribe push:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('❌ Eroare send-global:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Endpoint pentru a obține notificările recente
+app.get('/api/notifications/recent', async (req, res) => {
+  try {
+    const { data, error } = await supa
+      .from('global_notifications')
+      .select('*')
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    if (error) throw error;
+
+    res.json(data || []);
+  } catch (error) {
+    console.error('Eroare get notifications:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -629,10 +678,11 @@ wss.on('connection', ws=>{
       return;
     }
 
-    if (msg?.type === 'typing'){
-      broadcast({ type:'typing', data:{ active:!!msg.active, user:msg.user||'Anon', id:ws._id } });
-      return;
-    }
+if (msg?.type === 'global-notification') {
+  // Afișează notificarea pentru toți clienții
+  broadcast({ type: 'global-notification', data: msg.data });
+  return;
+}
 
     if (msg?.type === 'voice-join'){ voicePeers.set(ws._id, { user:msg.user||'—', muted:false }); broadcast({ type:'voice-join', data:{ id:ws._id, user:msg.user||'—' } }); return; }
     if (msg?.type === 'voice-leave'){ if (voicePeers.has(ws._id)) voicePeers.delete(ws._id); broadcast({ type:'voice-leave', data:{ id:ws._id } }); return; }
