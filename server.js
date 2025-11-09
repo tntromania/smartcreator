@@ -35,6 +35,30 @@ webpush.setVapidDetails(
   process.env.VAPID_PRIVATE_KEY
 );
 
+// POST /api/push/subscribe  — primește subscription-ul din browser
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const { subscription, user } = req.body || {};
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ error: 'bad-subscription' });
+    }
+
+    // salvează în DB dacă ai funcția; altfel păstrează în memorie
+    try {
+      await savePushSubscription(subscription, user || {});
+    } catch (e) {
+      console.warn('savePushSubscription failed, keeping in memory:', e?.message || e);
+      pushSubscriptions = pushSubscriptions.filter(s => s.subscription?.endpoint !== subscription.endpoint);
+      pushSubscriptions.push({ subscription, user, timestamp: new Date() });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('subscribe error:', e?.message || e);
+    res.status(500).json({ error: 'subscribe-failed' });
+  }
+});
+
 // Stocare subscription-uri push (în memorie - pentru început)
 let pushSubscriptions = [];
 
