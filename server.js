@@ -4,6 +4,7 @@ const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const webpush = require('web-push');
 
 /* ========= ENV ========= */
 const PORT                 = process.env.PORT || 10000;
@@ -25,6 +26,60 @@ app.use(express.json({ limit: '512kb' }));
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const ALLOW_NULL_ORIGIN = String(process.env.ALLOW_NULL_ORIGIN ?? '1').trim() === '1';
+
+/* ========= PUSH NOTIFICATIONS ========= */
+// Configurează VAPID Keys - vor fi setate prin variabile de mediu
+webpush.setVapidDetails(
+  'mailto:alexcaba2000z4@gmail.com',
+  process.env.VAPID_PUBLIC_KEY,
+  process.env.VAPID_PRIVATE_KEY
+);
+
+// Stocare subscription-uri push (în memorie - pentru început)
+let pushSubscriptions = [];
+
+// Funcție pentru a salva subscription-urile în Supabase (opțional)
+async function savePushSubscription(subscription, user = {}) {
+  try {
+    const { data, error } = await supa
+      .from('push_subscriptions')
+      .insert({
+        subscription: subscription,
+        user_email: user.email,
+        user_id: user.id,
+        created_at: new Date().toISOString()
+      })
+      .select();
+    
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Eroare salvare subscription:', error);
+    // Fallback la stocarea în memorie
+    pushSubscriptions.push({ subscription, user, timestamp: new Date() });
+  }
+}
+
+// Funcție pentru a încărca subscription-urile din Supabase
+async function loadPushSubscriptions() {
+  try {
+    const { data, error } = await supa
+      .from('push_subscriptions')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1000);
+    
+    if (!error && data) {
+      pushSubscriptions = data.map(row => ({
+        subscription: row.subscription,
+        user: { email: row.user_email, id: row.user_id },
+        timestamp: new Date(row.created_at)
+      }));
+    }
+  } catch (error) {
+    console.error('Eroare încărcare subscriptions:', error);
+  }
+}
 
 function isAllowedOrigin(origin) {
   if (!origin) return true;
@@ -272,6 +327,120 @@ app.post('/api/send', async (req,res)=>{
 
 /* ---------- AFFILIATE API ---------- */
 // Folosește tabelul tău: "affiliates" (user_id UNIQUE, aff_code UNIQUE)
+/* ---------- PUSH NOTIFICATIONS API ---------- */
+
+// Endpoint pentru abonare notificări
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const { subscription, user } = req.body;
+    
+    if (!subscription) {
+      return res.status(400).json({ error: 'Subscription required' });
+    }
+
+    // Verifică dacă subscription-ul există deja
+    const exists = pushSubscriptions.some(sub => 
+      sub.subscription.endpoint === subscription.endpoint
+    );
+
+    if (!exists) {
+      await savePushSubscription(subscription, user);
+      console.log(`✅ Subscription push adăugat. Total: ${pushSubscriptions.length}`);
+    }
+
+    res.json({ success: true, total: pushSubscriptions.length });
+  } catch (error) {
+    console.error('❌ Eroare subscribe push:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Endpoint pentru trimitere notificări (doar admin)
+app.post('/api/push/send', async (req, res) => {
+  try {
+    const { title, body, image, url } = req.body;
+    const authToken = req.headers.authorization?.replace('Bearer ', '');
+
+    // Verifică token-ul de admin
+    if (authToken !== process.env.ADMIN_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    if (!title || !body) {
+      return res.status(400).json({ error: 'Title and body required' });
+    }
+
+    const payload = JSON.stringify({
+      title: title,
+      body: body,
+      image: image,
+      url: url || 'https://smartcreator.ro/#sec-changelog',
+      icon: 'https://smartcreator.ro/logo3.png',
+      badge: 'https://smartcreator.ro/logo3.png',
+      tag: 'update-' + Date.now() // Prevent duplicate notifications
+    });
+
+    console.log(`📢 Trimitere notificare către ${pushSubscriptions.length} utilizatori`);
+
+    // Trimite tuturor
+    const sendPromises = pushSubscriptions.map(async (sub, index) => {
+      try {
+        await webpush.sendNotification(sub.subscription, payload);
+        return { success: true, index };
+      } catch (error) {
+        console.log(`❌ Subscription ${index} invalid:`, error.statusCode);
+        
+        // Șterge subscription-uri invalide
+        if (error.statusCode === 410 || error.statusCode === 404) {
+          pushSubscriptions = pushSubscriptions.filter(s => s !== sub);
+          // Șterge și din Supabase dacă există
+          try {
+            await supa.from('push_subscriptions')
+              .delete()
+              .eq('subscription->>endpoint', sub.subscription.endpoint);
+          } catch (dbError) {
+            console.error('Eroare ștergere subscription:', dbError);
+          }
+        }
+        return { success: false, index, error: error.message };
+      }
+    });
+
+    const results = await Promise.all(sendPromises);
+    const successful = results.filter(r => r.success).length;
+    
+    console.log(`✅ Notificări trimise cu succes: ${successful}/${results.length}`);
+    
+    res.json({ 
+      success: true, 
+      sent: successful, 
+      total: results.length,
+      details: `Notificare trimisă la ${successful} utilizatori`
+    });
+
+  } catch (error) {
+    console.error('❌ Eroare send push:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Endpoint pentru listarea subscription-urilor (doar admin)
+app.get('/api/push/subscriptions', async (req, res) => {
+  const authToken = req.headers.authorization?.replace('Bearer ', '');
+  
+  if (authToken !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  res.json({
+    total: pushSubscriptions.length,
+    subscriptions: pushSubscriptions.map(sub => ({
+      user: sub.user,
+      endpoint: sub.subscription.endpoint?.slice(0, 50) + '...',
+      timestamp: sub.timestamp
+    }))
+  });
+});
 async function genUniqueCode(){
   for (let i=0;i<6;i++){
     const c = crypto.randomBytes(4).toString('base64url').replace(/[^a-zA-Z0-9]/g,'').slice(0,7);
@@ -389,6 +558,11 @@ app.get('/api/aff/stats', async (req,res)=>{
 
     res.json({ clicks, leads, sales, revenue });
   }catch(e){ console.error('[aff/stats]', e?.message||e); res.status(500).json({ error:'aff-stats-failed' }); }
+});
+
+// Încarcă subscription-urile la pornire
+loadPushSubscriptions().then(() => {
+  console.log(`[PUSH] Subscription-uri încărcate: ${pushSubscriptions.length}`);
 });
 
 /* ========= WS ========= */
