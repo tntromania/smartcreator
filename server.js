@@ -357,6 +357,107 @@ function canGrantChatXp(email, inc){
   return allowed;
 }
 
+/* ===== VALIDARE MISIUNI (în funcție de ce a făcut userul) ===== */
+async function validateMissionProgress(mission, userId) {
+  // intervalul în care verificăm progresul misiunii
+  const now = new Date();
+  const startDate = mission.starts_at ? new Date(mission.starts_at) : new Date('1970-01-01T00:00:00Z');
+  const endDate   = mission.ends_at   ? new Date(mission.ends_at)   : now;
+
+  const startIso = startDate.toISOString();
+  const endIso   = endDate.toISOString();
+  const startTs  = startDate.getTime();
+  const endTs    = endDate.getTime();
+
+  /* === MISIUNE: watch_3_lessons -> user trebuie să fi terminat minim 3 lecții === */
+  if (mission.code === 'watch_3_lessons') {
+    try {
+      const { data, error } = await supa
+        .from('xp_events')
+        .select('meta, created_at')
+        .eq('user_id', userId)
+        .eq('type', 'lesson_complete')
+        .gte('created_at', startIso)
+        .lte('created_at', endIso);
+
+      if (error) {
+        console.error('[missions] xp_events error', error);
+        return { valid: false, reason: 'Nu am putut verifica progresul la lecții. Încearcă din nou mai târziu.' };
+      }
+
+      const events = data || [];
+      const lessons = new Set(
+        events
+          .map(ev => (ev.meta && (ev.meta.lesson || ev.meta.lesson_id)))
+          .filter(Boolean)
+      );
+
+      const count = lessons.size;
+      if (count >= 3) {
+        return { valid: true };
+      }
+
+      return {
+        valid: false,
+        reason: `Ai doar ${count}/3 lecții terminate în perioada misiunii.`
+      };
+    } catch (e) {
+      console.error('[missions] watch_3_lessons', e?.message || e);
+      return { valid: false, reason: 'Eroare la verificarea lecțiilor.' };
+    }
+  }
+
+  /* === MISIUNE: chat_10_messages -> minim 10 mesaje în chat în perioada misiunii === */
+  if (mission.code === 'chat_10_messages') {
+    try {
+      // luăm email-ul userului ca să-l legăm de chat_messages.user
+      const { data: prof, error: pErr } = await supa
+        .from('profiles')
+        .select('email')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (pErr || !prof?.email) {
+        console.error('[missions] profile for chat', pErr);
+        return { valid: false, reason: 'Nu ți-am găsit profilul pentru verificarea mesajelor din chat.' };
+      }
+
+      const { data: msgs, error: mErr } = await supa
+        .from('chat_messages')
+        .select('id, ts')
+        .eq('room', CHAT_ROOM)
+        .eq('user', prof.email)
+        .gte('ts', startTs)
+        .lte('ts', endTs);
+
+      if (mErr) {
+        console.error('[missions] chat_messages error', mErr);
+        return { valid: false, reason: 'Nu am putut verifica mesajele din chat.' };
+      }
+
+      const count = (msgs || []).length;
+      if (count >= 10) {
+        return { valid: true };
+      }
+
+      return {
+        valid: false,
+        reason: `Ai doar ${count}/10 mesaje în chat în perioada misiunii. Scrie câteva mesaje cu sens în chat. 🙂`
+      };
+    } catch (e) {
+      console.error('[missions] chat_10_messages', e?.message || e);
+      return { valid: false, reason: 'Eroare la verificarea mesajelor de chat.' };
+    }
+  }
+
+  // TODO: aici poți adăuga alte misiuni pe viitor (post_3_tiktoks, share_aff_3_friends etc.)
+
+  return {
+    valid: false,
+    reason: 'Nu există încă validare automată pentru acest tip de misiune.'
+  };
+}
+
 /* ================== ROUTES ================== */
 app.get('/healthz', (req,res)=>{
   res.json({
@@ -498,6 +599,109 @@ app.get('/api/xp/leaderboard', async (req,res)=>{
     res.json(data||[]);
   }catch(e){ console.error('[xp/leaderboard]', e?.message||e); res.status(500).json({ error:'xp-leaderboard-failed' }); }
 });
+/* ---------- MISSIONS API ---------- */
+app.post('/api/missions/complete', async (req, res) => {
+  try {
+    const { token, mission_code } = req.body || {};
+    const user = await getUserFromToken(token || req.headers.authorization || '');
+    if (!user) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    if (!mission_code) {
+      return res.status(400).json({ error: 'missing_mission_code' });
+    }
+
+    const nowIso = new Date().toISOString();
+
+    // 1. Luăm misiunea după code (și eventual active)
+    const { data: mission, error: mErr } = await supa
+      .from('missions')
+      .select('*')
+      .eq('code', mission_code)
+      .eq('active', true)
+      // dacă ai starts_at / ends_at în tabel, filtrezi aici:
+      .lte('starts_at', nowIso)
+      .or(`ends_at.is.null,ends_at.gte.${nowIso}`)
+      .maybeSingle();
+
+    if (mErr || !mission) {
+      console.warn('[missions/complete] mission_err', mErr);
+      return res.status(404).json({ error: 'mission_not_found_or_inactive' });
+    }
+
+    // 2. Verificăm dacă e deja completată pentru user
+    const { data: existing, error: exErr } = await supa
+      .from('mission_completions')
+      .select('id')
+      .eq('mission_id', mission.id)
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (exErr) {
+      console.error('[missions/complete] mission_completions check', exErr);
+    }
+
+    if (existing) {
+      return res.status(400).json({ error: 'already_completed' });
+    }
+
+    // 3. Validăm progresul misiunii (logică bazată pe xp_events / chat_messages)
+    const validation = await validateMissionProgress(mission, user.id);
+    if (!validation.valid) {
+      return res.status(400).json({
+        error: validation.reason || 'Nu ai îndeplinit încă condițiile misiunii.'
+      });
+    }
+
+    // 4. Marcăm misiunea ca și completată
+    const { error: insErr } = await supa
+      .from('mission_completions')
+      .insert({
+        mission_id: mission.id,
+        user_id: user.id
+      });
+
+    if (insErr) {
+      console.error('[missions/complete] insert', insErr);
+      const msg = String(insErr.message || '').toLowerCase();
+      if (msg.includes('duplicate') || msg.includes('unique')) {
+        return res.status(400).json({ error: 'already_completed' });
+      }
+      return res.status(500).json({ error: 'mission_completion_failed' });
+    }
+
+    // 5. XP pentru misiune – dacă ai coloana xp_reward o folosim, altfel XP_BY_TYPE.mission_complete (40)
+    const rewardXp = (mission.xp_reward != null ? mission.xp_reward : (XP_BY_TYPE.mission_complete || 40));
+    let newTotal = null;
+
+    try {
+      newTotal = await addXp(
+        user.id,
+        rewardXp,
+        'mission_complete',
+        { mission_id: mission.id, code: mission.code }
+      );
+    } catch (e) {
+      console.error('[missions/complete] addXp', e?.message || e);
+    }
+
+    const lvlInfo = levelFromXp(newTotal || 0);
+
+    return res.json({
+      ok: true,
+      mission: {
+        id: mission.id,
+        code: mission.code,
+        xp_reward: rewardXp,
+      },
+      level: lvlInfo
+    });
+  } catch (e) {
+    console.error('[missions/complete]', e?.message || e);
+    res.status(500).json({ error: 'missions-complete-failed' });
+  }
+});
+
 
 /* ---------- Chat API ---------- */
 app.get('/api/history', async (req,res)=>{
