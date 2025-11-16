@@ -292,6 +292,9 @@ const XP_BY_TYPE = {
   lesson_complete: 15,
   quiz_pass: 25,
   chat_message: null, // doar prin WS / /api/send
+  mission_complete: 40,    // când bifează o misiune săptămânală
+  daily_checkin: 10,       // butonul "Am lucrat azi"
+  income_milestone: 60,    // când bifează 1$, 10$, 50$, 100$
 };
 
 const XP_COOLDOWN_MS = 15_000; // 15s între granturi de chat pentru același user (există deja)
@@ -388,6 +391,87 @@ app.post('/api/xp/earn', async (req,res)=>{
     const newTotal = await addXp(user.id, XP_BY_TYPE[type], type, meta);
     res.json({ ok:true, ...levelFromXp(newTotal||0) });
   }catch(e){ console.error('[xp/earn]', e?.message||e); res.status(500).json({ error:'xp-earn-failed' }); }
+});
+app.post('/api/xp/redeem', async (req, res) => {
+  try {
+    const { token, reward_id } = req.body || {};
+    const user = await getUserFromToken(token || req.headers.authorization || '');
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+    if (!reward_id) return res.status(400).json({ error: 'missing_reward' });
+
+    // 1. Ia recompensa
+    const { data: reward, error: rErr } = await supa
+      .from('rewards')
+      .select('id, code, title, description, cost_xp, active')
+      .eq('id', reward_id)
+      .maybeSingle();
+
+    if (rErr || !reward || !reward.active) {
+      console.warn('[xp/redeem] reward_err', rErr);
+      return res.status(404).json({ error: 'reward_not_found' });
+    }
+
+    // 2. Verifică dacă nu e deja răscumpărată (dacă vrei one-time per user)
+    const { data: already } = await supa
+      .from('reward_redemptions')
+      .select('id')
+      .eq('user_id', user.id)
+      .eq('reward_id', reward.id)
+      .maybeSingle();
+
+    if (already) {
+      return res.status(400).json({ error: 'already_redeemed' });
+    }
+
+    // 3. XP curent (din user_xp – e tabela canonică)
+    const { data: ux } = await supa
+      .from('user_xp')
+      .select('xp')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    const currentXp = ux?.xp || 0;
+    if (currentXp < reward.cost_xp) {
+      return res.status(400).json({ error: 'not_enough_xp', current_xp: currentXp });
+    }
+
+    // 4. Scade XP folosind aceleași reguli ca la /xp/earn (delta negativ)
+    const newTotal = await addXp(
+      user.id,
+      -reward.cost_xp,
+      'reward_redeem',
+      { reward_id: reward.id, code: reward.code, cost_xp: reward.cost_xp }
+    );
+
+    // 5. Log în reward_redemptions
+    const { error: insErr } = await supa
+      .from('reward_redemptions')
+      .insert({
+        user_id: user.id,
+        reward_id: reward.id,
+        meta: {}
+      });
+
+    if (insErr) {
+      console.error('[xp/redeem] insert redemption', insErr);
+      return res.status(500).json({ error: 'redemption_failed' });
+    }
+
+    return res.json({
+      success: true,
+      new_xp: newTotal ?? (currentXp - reward.cost_xp),
+      reward: {
+        id: reward.id,
+        code: reward.code,
+        title: reward.title,
+        description: reward.description,
+        cost_xp: reward.cost_xp
+      }
+    });
+  } catch (e) {
+    console.error('[xp/redeem]', e?.message || e);
+    res.status(500).json({ error: 'xp-redeem-failed' });
+  }
 });
 app.get('/api/xp/leaderboard', async (req,res)=>{
   try{
