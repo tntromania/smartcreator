@@ -291,11 +291,14 @@ const XP_BY_TYPE = {
   profile_complete: 20,
   lesson_complete: 15,
   quiz_pass: 25,
-  chat_message: null, // doar prin WS / /api/send
-  mission_complete: 40,    // când bifează o misiune săptămânală
-  daily_checkin: 10,       // butonul "Am lucrat azi"
-  income_milestone: 60,    // când bifează 1$, 10$, 50$, 100$
+  chat_message: null,       // doar prin WS / /api/send
+  mission_complete: 40,     // când bifează o misiune săptămânală
+  daily_checkin: 15,        // butonul "Am lucrat azi" — 15 XP / zi
+  income_milestone: 60,     // când bifează 1$, 10$, 50$, 100$
+  streak_30: 400,           // ✅ nou: bonus mare la 30 de zile consecutive
+  daily_quests_all: 50,
 };
+
 
 const XP_COOLDOWN_MS = 15_000; // 15s între granturi de chat pentru același user (există deja)
 const lastXpGrant = new Map();  // email -> last_ts
