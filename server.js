@@ -325,16 +325,20 @@ async function stripeWebhookHandler(req, res) {
     const data = event.data.object;
 
     switch (event.type) {
-      case 'checkout.session.completed':
-        await handleCheckoutCompleted(data);
-        break;
-      case 'customer.subscription.updated':
-      case 'customer.subscription.deleted':
-        await handleSubscriptionUpdated(data);
-        break;
-      default:
-        // alte evenimente nu ne interesează momentan
-        break;
+case 'checkout.session.completed':
+  await handleCheckoutCompleted(data);
+  break;
+
+// putem trata la fel created/updated/deleted
+case 'customer.subscription.created':
+case 'customer.subscription.updated':
+case 'customer.subscription.deleted':
+  await handleSubscriptionUpdated(data, event.type);
+  break;
+
+default:
+  // alte evenimente nu ne interesează momentan
+  break;
     }
 
     res.json({ received: true });
@@ -416,12 +420,28 @@ async function handleCheckoutCompleted(session) {
   }
 }
 
-async function handleSubscriptionUpdated(subscription) {
+async function handleSubscriptionUpdated(subscription, eventType = 'customer.subscription.updated') {
   const customerId = subscription.customer;
-  const status = subscription.status; // active, trialing, canceled, etc.
-  const isActive = status === 'active' || status === 'trialing';
+  const status     = subscription.status; // active, trialing, canceled, etc.
+  const isActive   = status === 'active' || status === 'trialing';
 
-  console.log('🔄 subscription update', { customerId, status });
+  // ⏱ data de expirare a perioadei curente din Stripe (UNIX seconds -> ISO)
+  const periodEndIso = subscription.current_period_end
+    ? new Date(subscription.current_period_end * 1000).toISOString()
+    : null;
+
+  // dacă user-ul a dat „cancel at period end” sau a venit event deleted
+  const cancelAtPeriodEnd =
+    !!subscription.cancel_at_period_end ||
+    eventType === 'customer.subscription.deleted';
+
+  console.log('🔄 subscription update', {
+    customerId,
+    status,
+    eventType,
+    periodEndIso,
+    cancelAtPeriodEnd,
+  });
 
   const { data: profiles, error } = await supa
     .from('profiles')
@@ -439,13 +459,23 @@ async function handleSubscriptionUpdated(subscription) {
   }
 
   for (const p of profiles) {
+    // lifetime rămâne activ indiferent de abonament
     const shouldBeActive = p.lifetime_access ? true : isActive;
+
+    const update = {
+      is_active: shouldBeActive,
+      stripe_subscription_id: subscription.id,
+      abo_expires_at: periodEndIso,
+      abo_cancel_at_period_end: cancelAtPeriodEnd,
+    };
+
     await supa
       .from('profiles')
-      .update({ is_active: shouldBeActive })
+      .update(update)
       .eq('user_id', p.user_id);
   }
 }
+
 
 function levelFromXp(xpInt = 0) {
   const B = LEVEL_BASE;
