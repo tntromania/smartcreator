@@ -6,11 +6,26 @@ const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const webpush = require('web-push');
+const Stripe = require('stripe');
 
 /* ========= ENV ========= */
 const PORT                 = process.env.PORT || 10000;
 const SUPABASE_URL         = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// === STRIPE CONFIG ===
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// mapezi prețurile Stripe -> planurile tale interne
+const PRICE_TO_PLAN = {
+  // pune aici ID-urile reale de preț din Stripe Dashboard
+  // ex: 'prod_SbveE02KhkaRgh' : 'monthly',
+  //     'prod_SYexXX9WZJzqEr' : 'yearly',
+  //     'prod_SYevGWLebBRXOA' : 'lifetime',
+};
+
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const CHAT_ROOM            = process.env.CHAT_ROOM || 'global';
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
@@ -21,6 +36,15 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const app = express();
+
+/* ===== STRIPE WEBHOOK (trebuie înainte de express.json) ===== */
+app.post(
+  '/api/stripe/webhook',
+  express.raw({ type: 'application/json' }),
+  stripeWebhookHandler
+);
+
+// restul API-ului tău folosește JSON normal
 app.use(express.json({ limit: '512kb' }));
 
 /* ========= CORS (robust, cu wildcard) ========= */
@@ -273,6 +297,149 @@ loadPushSubscriptions().then(() => {
 /* ========= XP / LEVEL ========= */
 /** Bază de nivel mai „greu”: 150 (poți modifica prin ENV LEVEL_BASE=...) */
 const LEVEL_BASE = Number(process.env.LEVEL_BASE || 130);
+
+/* ========= STRIPE WEBHOOK LOGIC ========= */
+
+async function stripeWebhookHandler(req, res) {
+  const sig = req.headers['stripe-signature'];
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,                // raw body (mulțumită express.raw)
+      sig,
+      STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('[stripe] signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    const data = event.data.object;
+
+    switch (event.type) {
+      case 'checkout.session.completed':
+        await handleCheckoutCompleted(data);
+        break;
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted':
+        await handleSubscriptionUpdated(data);
+        break;
+      default:
+        // alte evenimente nu ne interesează momentan
+        break;
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('[stripe] handler error:', err);
+    res.status(500).send('Webhook handler error');
+  }
+}
+
+async function handleCheckoutCompleted(session) {
+  // email-ul clientului – super important să fie același ca în Supabase
+  const email =
+    (session.customer_details && session.customer_details.email) ||
+    session.customer_email ||
+    null;
+
+  if (!email) {
+    console.warn('[stripe] checkout complet fără email');
+    return;
+  }
+
+  const customerId = session.customer;
+  const mode = session.mode; // 'payment' sau 'subscription'
+
+  // luăm priceId-ul exact de pe session
+  let priceId = null;
+  try {
+    const full = await stripe.checkout.sessions.retrieve(session.id, {
+      expand: ['line_items.data.price'],
+    });
+    priceId = full?.line_items?.data?.[0]?.price?.id || null;
+  } catch (e) {
+    console.error('[stripe] nu pot citi line_items:', e.message);
+  }
+
+  const plan = PRICE_TO_PLAN[priceId] || null;
+
+  console.log('✅ checkout.session.completed', { email, plan, priceId, mode });
+
+  // vezi dacă există deja profilul după email
+  const { data: existing, error } = await supa
+    .from('profiles')
+    .select('user_id, lifetime_access')
+    .eq('email', email)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[stripe] read profile error:', error);
+  }
+
+  // payload comun pentru update/insert
+  const update = {
+    stripe_customer_id: customerId,
+    stripe_price_id: priceId,
+    access_plan: plan,
+    is_active: true,
+  };
+
+  if (plan === 'lifetime') {
+    update.lifetime_access = true;
+  }
+
+  if (mode === 'subscription' && session.subscription) {
+    update.stripe_subscription_id = session.subscription;
+  }
+
+  if (existing && existing.user_id) {
+    await supa
+      .from('profiles')
+      .update(update)
+      .eq('user_id', existing.user_id);
+  } else {
+    await supa
+      .from('profiles')
+      .insert({
+        email,
+        ...update,
+      });
+  }
+}
+
+async function handleSubscriptionUpdated(subscription) {
+  const customerId = subscription.customer;
+  const status = subscription.status; // active, trialing, canceled, etc.
+  const isActive = status === 'active' || status === 'trialing';
+
+  console.log('🔄 subscription update', { customerId, status });
+
+  const { data: profiles, error } = await supa
+    .from('profiles')
+    .select('user_id, lifetime_access')
+    .eq('stripe_customer_id', customerId);
+
+  if (error) {
+    console.error('[stripe] subscription profiles error:', error);
+    return;
+  }
+
+  if (!profiles || !profiles.length) {
+    console.warn('[stripe] niciun profil pentru customer', customerId);
+    return;
+  }
+
+  for (const p of profiles) {
+    const shouldBeActive = p.lifetime_access ? true : isActive;
+    await supa
+      .from('profiles')
+      .update({ is_active: shouldBeActive })
+      .eq('user_id', p.user_id);
+  }
+}
 
 function levelFromXp(xpInt = 0) {
   const B = LEVEL_BASE;
