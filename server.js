@@ -12,7 +12,15 @@ const Stripe = require('stripe');
 const PORT                 = process.env.PORT || 10000;
 const SUPABASE_URL         = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.error('[FATAL] Lipsesc SUPABASE_URL / SUPABASE_SERVICE_KEY');
+  process.exit(1);
+}
+
+// ✅ o singură dată
 const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
 
 // === STRIPE CONFIG ===
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -32,8 +40,6 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('[FATAL] Lipsesc SUPABASE_URL / SUPABASE_SERVICE_KEY');
   process.exit(1);
 }
-
-const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const app = express();
 
