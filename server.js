@@ -1,6 +1,7 @@
 // server.js
 require('dotenv').config();
 const express = require('express');
+const axios = require('axios');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
@@ -1286,4 +1287,54 @@ if (msg?.type === 'global-notification') {
       if (voicePeers.has(ws._id)){ voicePeers.delete(ws._id); broadcast({ type:'voice-leave', data:{ id:ws._id } }); }
     }catch{}
   });
+});
+
+// La început, asigură-te că ai:
+const axios = require('axios');
+
+// Apoi, undeva după alte rute (app.get, app.post), adaugă:
+
+app.post('/api/yt-download', async (req, res) => {
+  try {
+    const { url } = req.body;
+    
+    const infoRes = await axios.post(
+      'https://yt1s.com.co/api/ajaxSearch/index',
+      `q=${encodeURIComponent(url)}&vt=home`,
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    
+    if (infoRes.data.status !== 'ok') {
+      return res.json({ success: false, error: 'Video not found' });
+    }
+    
+    const videoId = url.match(/[?&]v=([^&]+)/)?.[1] || url.match(/youtu\.be\/([^?]+)/)?.[1];
+    const links = infoRes.data.links?.mp4;
+    const quality1080 = links?.['1080'] || links?.['720'] || links?.['480'];
+    
+    if (!quality1080) {
+      return res.json({ success: false, error: 'Quality not available' });
+    }
+    
+    const convertRes = await axios.post(
+      'https://yt1s.com.co/api/ajaxConvert/convert',
+      `vid=${videoId}&k=${quality1080.k}`,
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    
+    if (convertRes.data.status !== 'ok') {
+      return res.json({ success: false, error: 'Conversion failed' });
+    }
+    
+    res.json({
+      success: true,
+      downloadUrl: convertRes.data.dlink,
+      title: infoRes.data.title,
+      thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+      quality: quality1080.q
+    });
+    
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
 });
