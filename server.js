@@ -1289,47 +1289,81 @@ if (msg?.type === 'global-notification') {
   });
 });
 
+/* =========================================
+   YOUTUBE DOWNLOADER ENDPOINT (FIXED)
+   ========================================= */
 app.post('/api/yt-download', async (req, res) => {
+  console.log('[YT-Downloader] Cerere primită:', req.body.url); // Log pentru debugging
+
   try {
     const { url } = req.body;
     
+    if (!url) {
+        return res.status(400).json({ success: false, error: 'URL lipsă' });
+    }
+
+    // Header fals pentru a părea browser real
+    const fakeBrowserHeaders = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://yt1s.com.co/',
+        'Origin': 'https://yt1s.com.co'
+    };
+
+    // 1. Obține informații video
+    console.log('[YT-Downloader] Cautare video...');
     const infoRes = await axios.post(
       'https://yt1s.com.co/api/ajaxSearch/index',
       `q=${encodeURIComponent(url)}&vt=home`,
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      { headers: fakeBrowserHeaders }
     );
     
-    if (infoRes.data.status !== 'ok') {
-      return res.json({ success: false, error: 'Video not found' });
+    if (!infoRes.data || infoRes.data.status !== 'ok') {
+      console.error('[YT-Downloader] Eroare API Search:', infoRes.data);
+      return res.json({ success: false, error: 'Video not found or API blocked' });
     }
     
-    const videoId = url.match(/[?&]v=([^&]+)/)?.[1] || url.match(/youtu\.be\/([^?]+)/)?.[1];
+    const videoId = infoRes.data.vid; 
     const links = infoRes.data.links?.mp4;
-    const quality1080 = links?.['1080'] || links?.['720'] || links?.['480'];
     
-    if (!quality1080) {
+    // Selectează calitatea (preferabil 1080p, fallback la altele)
+    let selectedQuality = links?.['1080'] || links?.['720'] || links?.['480'] || links?.['auto'];
+    
+    // Fallback extrem: prima cheie disponibilă
+    if (!selectedQuality && links) {
+        const keys = Object.keys(links);
+        if(keys.length > 0) selectedQuality = links[keys[0]];
+    }
+
+    if (!selectedQuality) {
       return res.json({ success: false, error: 'Quality not available' });
     }
     
+    // 2. Convertește și obține link-ul
+    console.log(`[YT-Downloader] Conversie calitate: ${selectedQuality.q}`);
     const convertRes = await axios.post(
       'https://yt1s.com.co/api/ajaxConvert/convert',
-      `vid=${videoId}&k=${quality1080.k}`,
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      `vid=${videoId}&k=${selectedQuality.k}`,
+      { headers: fakeBrowserHeaders }
     );
     
     if (convertRes.data.status !== 'ok') {
+      console.error('[YT-Downloader] Eroare API Convert:', convertRes.data);
       return res.json({ success: false, error: 'Conversion failed' });
     }
+    
+    console.log('[YT-Downloader] Succes! Trimit URL.');
     
     res.json({
       success: true,
       downloadUrl: convertRes.data.dlink,
       title: infoRes.data.title,
       thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-      quality: quality1080.q
+      quality: selectedQuality.q
     });
     
   } catch (error) {
-    res.json({ success: false, error: error.message });
+    console.error('[YT-Downloader] Server Error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
