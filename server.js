@@ -1290,7 +1290,7 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   YOUTUBE DOWNLOADER (Engine: Cobalt + OEmbed)
+   YOUTUBE DOWNLOADER (Fixed for Cobalt API v10)
    ========================================= */
 app.post('/api/yt-download', async (req, res) => {
   console.log('[Downloader] Procesez URL:', req.body.url);
@@ -1299,55 +1299,64 @@ app.post('/api/yt-download', async (req, res) => {
     const { url } = req.body;
     if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
 
-    // PASUL 1: Luăm Titlul și Poza (Thumbnail) oficial de la YouTube
-    // (Asta merge mereu și nu e blocat)
+    // PASUL 1: Luăm metadate (Titlu/Poză) prin OEmbed
     let metaData = { title: 'Video YouTube', thumbnail: '' };
     try {
-        const oembed = await axios.get(`https://www.youtube.com/oembed?url=${url}&format=json`);
-        metaData.title = oembed.data.title;
-        metaData.thumbnail = oembed.data.thumbnail_url;
+        // Folosim noembed ca proxy public rapid pentru titlu/poză
+        const oembed = await axios.get(`https://noembed.com/embed?url=${url}`);
+        if (oembed.data.title) {
+            metaData.title = oembed.data.title;
+            metaData.thumbnail = oembed.data.thumbnail_url;
+        }
     } catch (e) {
-        console.warn('[Downloader] Nu am putut lua titlul (nu e grav):', e.message);
+        console.warn('[Downloader] Nu am putut lua titlul:', e.message);
     }
 
-    // PASUL 2: Obținem link-ul de download folosind Cobalt API
-    // Cobalt este mai prietenos cu serverele
-    const cobaltResponse = await axios.post('https://api.cobalt.tools/api/json', {
+    // PASUL 2: Cerere către Cobalt API (Versiunea Nouă)
+    // Endpoint-ul nou este POST https://api.cobalt.tools/ (fără /api/json)
+    // Parametrii noi sunt: videoQuality, audioFormat, filenameStyle
+    const cobaltResponse = await axios.post('https://api.cobalt.tools/', {
         url: url,
-        vCodec: 'h264',
-        vQuality: '1080',
-        aFormat: 'mp3',
-        filenamePattern: 'basic'
+        videoQuality: '1080',
+        audioFormat: 'mp3',
+        filenameStyle: 'basic',
+        downloadMode: 'auto'
     }, {
         headers: {
             'Accept': 'application/json',
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
     });
 
     const data = cobaltResponse.data;
 
-    // Verificăm dacă Cobalt ne-a dat link-ul
-    if (!data || (data.status !== 'stream' && data.status !== 'redirect')) {
+    // Cobalt returnează status: 'stream', 'redirect' sau 'picker'
+    if (!data || (data.status !== 'stream' && data.status !== 'redirect' && data.status !== 'picker')) {
         console.error('[Downloader] Cobalt Error:', data);
-        return res.json({ success: false, error: 'Serverul nu a putut genera link-ul. Încearcă alt video.' });
+        return res.json({ success: false, error: 'Serverul nu a putut genera link-ul.' });
+    }
+
+    // Uneori Cobalt returnează "picker" dacă sunt mai multe variante (audio/video separate)
+    // Luăm prima variantă dacă e picker, altfel luăm url-ul direct
+    let finalUrl = data.url;
+    if (data.status === 'picker' && data.picker && data.picker.length > 0) {
+        finalUrl = data.picker[0].url;
     }
 
     console.log('[Downloader] Succes! Link generat.');
 
-    // Trimitem totul înapoi la Frontend
     res.json({
       success: true,
-      downloadUrl: data.url,
+      downloadUrl: finalUrl,
       title: metaData.title,
       thumbnail: metaData.thumbnail,
       quality: 'HD'
     });
 
   } catch (error) {
-    console.error('[Downloader] Eroare critică:', error.message);
-    // Dacă și Cobalt eșuează, trimitem eroarea la client
-    res.status(500).json({ success: false, error: 'Eroare server extern. Încearcă mai târziu.' });
+    // Logăm eroarea completă pentru debugging
+    console.error('[Downloader] Eroare server:', error.response ? error.response.data : error.message);
+    res.status(500).json({ success: false, error: 'Eroare la procesarea video-ului. Încearcă mai târziu.' });
   }
 });
