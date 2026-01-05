@@ -1290,73 +1290,81 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   YOUTUBE DOWNLOADER (Fixed for Cobalt API v10)
+   YOUTUBE DOWNLOADER (Multi-Instance Cobalt)
    ========================================= */
 app.post('/api/yt-download', async (req, res) => {
   console.log('[Downloader] Procesez URL:', req.body.url);
+  const { url } = req.body;
 
+  if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
+
+  // 1. Luăm Titlul/Poza (Metoda sigură noembed)
+  let metaData = { title: 'Video YouTube', thumbnail: '' };
   try {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
-
-    // PASUL 1: Luăm metadate (Titlu/Poză) prin OEmbed
-    let metaData = { title: 'Video YouTube', thumbnail: '' };
-    try {
-        // Folosim noembed ca proxy public rapid pentru titlu/poză
-        const oembed = await axios.get(`https://noembed.com/embed?url=${url}`);
-        if (oembed.data.title) {
-            metaData.title = oembed.data.title;
-            metaData.thumbnail = oembed.data.thumbnail_url;
-        }
-    } catch (e) {
-        console.warn('[Downloader] Nu am putut lua titlul:', e.message);
-    }
-
-    // PASUL 2: Cerere către Cobalt API (Versiunea Nouă)
-    // Endpoint-ul nou este POST https://api.cobalt.tools/ (fără /api/json)
-    // Parametrii noi sunt: videoQuality, audioFormat, filenameStyle
-    const cobaltResponse = await axios.post('https://api.cobalt.tools/', {
-        url: url,
-        videoQuality: '1080',
-        audioFormat: 'mp3',
-        filenameStyle: 'basic',
-        downloadMode: 'auto'
-    }, {
-        headers: {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-    });
-
-    const data = cobaltResponse.data;
-
-    // Cobalt returnează status: 'stream', 'redirect' sau 'picker'
-    if (!data || (data.status !== 'stream' && data.status !== 'redirect' && data.status !== 'picker')) {
-        console.error('[Downloader] Cobalt Error:', data);
-        return res.json({ success: false, error: 'Serverul nu a putut genera link-ul.' });
-    }
-
-    // Uneori Cobalt returnează "picker" dacă sunt mai multe variante (audio/video separate)
-    // Luăm prima variantă dacă e picker, altfel luăm url-ul direct
-    let finalUrl = data.url;
-    if (data.status === 'picker' && data.picker && data.picker.length > 0) {
-        finalUrl = data.picker[0].url;
-    }
-
-    console.log('[Downloader] Succes! Link generat.');
-
-    res.json({
-      success: true,
-      downloadUrl: finalUrl,
-      title: metaData.title,
-      thumbnail: metaData.thumbnail,
-      quality: 'HD'
-    });
-
-  } catch (error) {
-    // Logăm eroarea completă pentru debugging
-    console.error('[Downloader] Eroare server:', error.response ? error.response.data : error.message);
-    res.status(500).json({ success: false, error: 'Eroare la procesarea video-ului. Încearcă mai târziu.' });
+      const oembed = await axios.get(`https://noembed.com/embed?url=${url}`);
+      if (oembed.data.title) {
+          metaData.title = oembed.data.title;
+          metaData.thumbnail = oembed.data.thumbnail_url;
+      }
+  } catch (e) {
+      console.warn('[Downloader] Warning titlu:', e.message);
   }
+
+  // 2. Lista de servere Cobalt alternative (Community Instances)
+  // Dacă unul e blocat, trecem la următorul.
+  const COBALT_SERVERS = [
+      'https://cobalt.api.sc',           // Server comunitar stabil
+      'https://api.cobalt.tools',        // Oficial (poate cere auth)
+      'https://cobalt.7th.solutions'     // Alternativă
+  ];
+
+  for (const serverUrl of COBALT_SERVERS) {
+      console.log(`[Downloader] Încerc serverul: ${serverUrl} ...`);
+      
+      try {
+          // Configurare pentru Cobalt v10 (JSON body)
+          const response = await axios.post(`${serverUrl}/`, {
+              url: url,
+              videoQuality: '1080',
+              audioFormat: 'mp3',
+              filenameStyle: 'basic',
+              downloadMode: 'auto'
+          }, {
+              headers: {
+                  'Accept': 'application/json',
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+              },
+              timeout: 10000 // 10 secunde timeout per server
+          });
+
+          const data = response.data;
+
+          // Verificăm succesul
+          if (data && (data.status === 'stream' || data.status === 'redirect' || data.status === 'picker')) {
+              
+              let finalUrl = data.url;
+              if (data.status === 'picker' && data.picker && data.picker.length > 0) {
+                  finalUrl = data.picker[0].url;
+              }
+
+              console.log('[Downloader] Succes! Link generat de:', serverUrl);
+              
+              return res.json({
+                  success: true,
+                  downloadUrl: finalUrl,
+                  title: metaData.title,
+                  thumbnail: metaData.thumbnail,
+                  quality: 'HD'
+              });
+          }
+      } catch (err) {
+          console.warn(`[Downloader] Eșec pe ${serverUrl}:`, err.response?.data || err.message);
+          // Continuăm la următorul server din listă...
+      }
+  }
+
+  // Dacă am ieșit din buclă, niciun server nu a mers
+  console.error('[Downloader] Toate serverele au eșuat.');
+  res.status(500).json({ success: false, error: 'Toate serverele sunt ocupate. Încearcă mai târziu.' });
 });
