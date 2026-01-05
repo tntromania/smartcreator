@@ -1290,80 +1290,64 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   YOUTUBE DOWNLOADER ENDPOINT (FIXED)
+   YOUTUBE DOWNLOADER (Engine: Cobalt + OEmbed)
    ========================================= */
 app.post('/api/yt-download', async (req, res) => {
-  console.log('[YT-Downloader] Cerere primită:', req.body.url); // Log pentru debugging
+  console.log('[Downloader] Procesez URL:', req.body.url);
 
   try {
     const { url } = req.body;
-    
-    if (!url) {
-        return res.status(400).json({ success: false, error: 'URL lipsă' });
+    if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
+
+    // PASUL 1: Luăm Titlul și Poza (Thumbnail) oficial de la YouTube
+    // (Asta merge mereu și nu e blocat)
+    let metaData = { title: 'Video YouTube', thumbnail: '' };
+    try {
+        const oembed = await axios.get(`https://www.youtube.com/oembed?url=${url}&format=json`);
+        metaData.title = oembed.data.title;
+        metaData.thumbnail = oembed.data.thumbnail_url;
+    } catch (e) {
+        console.warn('[Downloader] Nu am putut lua titlul (nu e grav):', e.message);
     }
 
-    // Header fals pentru a părea browser real
-    const fakeBrowserHeaders = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://yt1s.com.co/',
-        'Origin': 'https://yt1s.com.co'
-    };
+    // PASUL 2: Obținem link-ul de download folosind Cobalt API
+    // Cobalt este mai prietenos cu serverele
+    const cobaltResponse = await axios.post('https://api.cobalt.tools/api/json', {
+        url: url,
+        vCodec: 'h264',
+        vQuality: '1080',
+        aFormat: 'mp3',
+        filenamePattern: 'basic'
+    }, {
+        headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+        }
+    });
 
-    // 1. Obține informații video
-    console.log('[YT-Downloader] Cautare video...');
-    const infoRes = await axios.post(
-      'https://yt1s.com.co/api/ajaxSearch/index',
-      `q=${encodeURIComponent(url)}&vt=home`,
-      { headers: fakeBrowserHeaders }
-    );
-    
-    if (!infoRes.data || infoRes.data.status !== 'ok') {
-      console.error('[YT-Downloader] Eroare API Search:', infoRes.data);
-      return res.json({ success: false, error: 'Video not found or API blocked' });
-    }
-    
-    const videoId = infoRes.data.vid; 
-    const links = infoRes.data.links?.mp4;
-    
-    // Selectează calitatea (preferabil 1080p, fallback la altele)
-    let selectedQuality = links?.['1080'] || links?.['720'] || links?.['480'] || links?.['auto'];
-    
-    // Fallback extrem: prima cheie disponibilă
-    if (!selectedQuality && links) {
-        const keys = Object.keys(links);
-        if(keys.length > 0) selectedQuality = links[keys[0]];
+    const data = cobaltResponse.data;
+
+    // Verificăm dacă Cobalt ne-a dat link-ul
+    if (!data || (data.status !== 'stream' && data.status !== 'redirect')) {
+        console.error('[Downloader] Cobalt Error:', data);
+        return res.json({ success: false, error: 'Serverul nu a putut genera link-ul. Încearcă alt video.' });
     }
 
-    if (!selectedQuality) {
-      return res.json({ success: false, error: 'Quality not available' });
-    }
-    
-    // 2. Convertește și obține link-ul
-    console.log(`[YT-Downloader] Conversie calitate: ${selectedQuality.q}`);
-    const convertRes = await axios.post(
-      'https://yt1s.com.co/api/ajaxConvert/convert',
-      `vid=${videoId}&k=${selectedQuality.k}`,
-      { headers: fakeBrowserHeaders }
-    );
-    
-    if (convertRes.data.status !== 'ok') {
-      console.error('[YT-Downloader] Eroare API Convert:', convertRes.data);
-      return res.json({ success: false, error: 'Conversion failed' });
-    }
-    
-    console.log('[YT-Downloader] Succes! Trimit URL.');
-    
+    console.log('[Downloader] Succes! Link generat.');
+
+    // Trimitem totul înapoi la Frontend
     res.json({
       success: true,
-      downloadUrl: convertRes.data.dlink,
-      title: infoRes.data.title,
-      thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-      quality: selectedQuality.q
+      downloadUrl: data.url,
+      title: metaData.title,
+      thumbnail: metaData.thumbnail,
+      quality: 'HD'
     });
-    
+
   } catch (error) {
-    console.error('[YT-Downloader] Server Error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
+    console.error('[Downloader] Eroare critică:', error.message);
+    // Dacă și Cobalt eșuează, trimitem eroarea la client
+    res.status(500).json({ success: false, error: 'Eroare server extern. Încearcă mai târziu.' });
   }
 });
