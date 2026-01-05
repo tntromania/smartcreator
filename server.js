@@ -1290,14 +1290,31 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   SMART DOWNLOADER (Video + Transcript)
+   SMART DOWNLOADER (RapidAPI: Video + Subs)
    ========================================= */
-const { YoutubeTranscript } = require('youtube-transcript'); // ✅ Importăm librăria nouă
+const axios = require('axios'); // Asigură-te că ai axios importat sus
 
-// Helper ID
+// Helper pentru ID
 function extractVideoId(url) {
     const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
     return match ? match[1] : null;
+}
+
+// Helper simplu pentru a curăța textul din XML (subtitrările vin des ca XML)
+function cleanTranscriptXML(xmlData) {
+    if (!xmlData) return '';
+    // Dacă e deja text simplu (nu are tag-uri <text>), returnăm direct
+    if (!xmlData.includes('<text')) return xmlData;
+    
+    // Eliminăm tag-urile XML și păstrăm doar conținutul
+    // Regex: Găsește tot ce e între > și <
+    return xmlData
+        .replace(/<[^>]*>/g, ' ')       // Șterge tag-urile
+        .replace(/\s+/g, ' ')           // Elimină spațiile multiple
+        .replace(/&amp;/g, '&')         // Fix caractere speciale
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+        .trim();
 }
 
 app.post('/api/yt-download', async (req, res) => {
@@ -1309,56 +1326,65 @@ app.post('/api/yt-download', async (req, res) => {
   const videoId = extractVideoId(url);
   if (!videoId) return res.status(400).json({ success: false, error: 'Link invalid' });
 
-  // 🔑 CHEIA TA RAPIDAPI
+  // 🔑 CHEIA TA RAPIDAPI (Aceeași de dinainte)
   const RAPID_API_KEY = '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3'; 
 
   try {
-      // --- 1. OBTINEM TRANSCRIPTUL (Paralel) ---
-      // Folosim un Promise.allSettled ca să nu crăpe totul dacă video-ul nu are subtitrări
-      const [transcriptResult, videoResult] = await Promise.allSettled([
-          YoutubeTranscript.fetchTranscript(videoId),
-          axios.request({
-            method: 'GET',
-            url: 'https://youtube-media-downloader.p.rapidapi.com/v2/video/details',
-            params: { videoId: videoId },
-            headers: {
-              'x-rapidapi-key': RAPID_API_KEY,
-              'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
-            }
-          })
-      ]);
+      console.log(`[RapidAPI] Fetching details for ${videoId}...`);
 
-      // --- 2. PROCESAM VIDEO-UL ---
-      if (videoResult.status === 'rejected' || !videoResult.value.data.videos) {
-          throw new Error('Eroare la obținerea video-ului.');
-      }
-      
-      const data = videoResult.value.data;
+      // 1. Cerem detaliile video-ului + subtitrările
+      const response = await axios.get('https://youtube-media-downloader.p.rapidapi.com/v2/video/details', {
+        params: { videoId: videoId },
+        headers: {
+          'x-rapidapi-key': RAPID_API_KEY,
+          'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
+        }
+      });
+
+      const data = response.data;
+      if (!data || !data.videos) throw new Error('API-ul nu a returnat date.');
+
+      // --- LOGICĂ VIDEO (Prioritate 1080p cu audio) ---
       const videos = data.videos.items;
-
-      // Logică avansată pentru a găsi cea mai bună calitate CU SUNET
-      // Multe API-uri dau 1080p FĂRĂ sunet. Verificăm proprietatea 'hasAudio' dacă există, sau presupunem că mp4 e ok.
       
+      // Căutăm în ordine:
+      // 1. 1080p care ARE audio (uneori API-ul le marchează 'hasAudio': true sau nu specifică)
+      // 2. 720p care ARE audio
+      // 3. Orice mp4
       let selectedVideo = 
-          // Încercăm 1080p
           videos.find(v => v.quality === '1080p' && v.extension === 'mp4' && v.hasAudio !== false) ||
-          // Fallback la 720p (cel mai sigur HD)
           videos.find(v => v.quality === '720p' && v.extension === 'mp4') ||
-          // Orice altceva
+          videos.find(v => v.quality === '480p' && v.extension === 'mp4') ||
           videos[0];
 
-      if (!selectedVideo) throw new Error('Nu am găsit link valid.');
+      if (!selectedVideo) throw new Error('Nu am găsit link video.');
 
-      // --- 3. PROCESAM TRANSCRIPTUL ---
+      // --- LOGICĂ TRANSCRIPT (Din același răspuns) ---
       let transcriptText = null;
-      if (transcriptResult.status === 'fulfilled') {
-          // Librăria returnează un array de obiecte {text, duration, offset}. 
-          // Le unim într-un text lung.
-          transcriptText = transcriptResult.value.map(item => item.text).join(' ');
-          // Curățăm caracterele HTML (ex: &amp;)
-          transcriptText = transcriptText.replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+
+      // Verificăm dacă API-ul ne-a dat lista de subtitrări
+      if (data.subtitles && data.subtitles.items && data.subtitles.items.length > 0) {
+          const subs = data.subtitles.items;
+          console.log(`[RapidAPI] Găsit ${subs.length} subtitrări.`);
+
+          // Căutăm Română (ro) sau Engleză (en)
+          // Verificăm proprietățile 'code' sau 'languageCode'
+          const targetSub = subs.find(s => s.code === 'ro' || s.name?.toLowerCase().includes('romanian')) || 
+                            subs.find(s => s.code === 'en' || s.name?.toLowerCase().includes('english')) || 
+                            subs[0];
+
+          if (targetSub && targetSub.url) {
+              try {
+                  console.log(`[Transcript] Descarc text de la: ${targetSub.url}`);
+                  // Facem request direct la URL-ul subtitrării (e link public, nu costă credits)
+                  const subRes = await axios.get(targetSub.url);
+                  transcriptText = cleanTranscriptXML(subRes.data);
+              } catch (err) {
+                  console.warn('[Transcript] Eroare download text:', err.message);
+              }
+          }
       } else {
-          console.warn('[Transcript] Nu există subtitrări:', transcriptResult.reason?.message);
+          console.log('[Transcript] Video-ul nu are subtitrări disponibile în API.');
       }
 
       console.log(`[Success] Video: ${selectedVideo.quality} | Transcript: ${transcriptText ? 'DA' : 'NU'}`);
@@ -1370,11 +1396,16 @@ app.post('/api/yt-download', async (req, res) => {
           title: data.title || 'YouTube Video',
           thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
           quality: selectedVideo.quality,
-          transcript: transcriptText // Trimitem și textul
+          transcript: transcriptText
       });
 
   } catch (error) {
-      console.error('[Eroare Server]:', error.message);
-      res.status(500).json({ success: false, error: 'Eroare la procesare.' });
+      console.error('[Eroare Server]:', error.response ? error.response.data : error.message);
+      
+      if (error.response && error.response.status === 429) {
+          return res.status(429).json({ success: false, error: 'Limita zilnică RapidAPI atinsă.' });
+      }
+
+      res.status(500).json({ success: false, error: 'Eroare procesare video.' });
   }
 });

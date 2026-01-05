@@ -14,7 +14,6 @@
     "express": "^4.19.2",
     "stripe": "^16.0.0",
     "ws": "^8.18.0",
-    "web-push": "^3.6.7",
-    "youtube-transcript": "^1.2.1"
+    "web-push": "^3.6.7"
   }
 }
