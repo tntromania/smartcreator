@@ -1290,99 +1290,89 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   YOUTUBE DOWNLOADER (FINAL & STABLE)
+   YOUTUBE DOWNLOADER (Via RAPIDAPI)
    ========================================= */
+
+// Funcție helper pentru a extrage ID-ul corect (API-ul cere ID, nu URL)
+function extractVideoId(url) {
+    const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
+    return match ? match[1] : null;
+}
+
 app.post('/api/yt-download', async (req, res) => {
   const { url } = req.body;
-  console.log('[Downloader] URL:', url);
+  console.log('[Downloader] Procesez URL:', url);
 
   if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
 
-  // 1. Luăm Titlu/Poză (Rapid, prin noembed)
-  let metaData = { title: 'Video YouTube', thumbnail: '' };
+  const videoId = extractVideoId(url);
+  if (!videoId) {
+      return res.status(400).json({ success: false, error: 'Link YouTube invalid' });
+  }
+
+  // 🔴 PUNE CHEIA TA AICI (între ghilimele)
+  const RAPID_API_KEY = '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3'; 
+
+  if (RAPID_API_KEY === '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3') {
+      console.error('[Downloader] Cheia RapidAPI lipsește!');
+      return res.status(500).json({ success: false, error: 'Serverul nu este configurat (lipsește API Key).' });
+  }
+
   try {
-      const oembed = await axios.get(`https://noembed.com/embed?url=${url}`);
-      if (oembed.data.title) {
-          metaData.title = oembed.data.title;
-          metaData.thumbnail = oembed.data.thumbnail_url;
+      console.log(`[Downloader] Cerere RapidAPI pentru ID: ${videoId}`);
+
+      const options = {
+        method: 'GET',
+        url: 'https://youtube-media-downloader.p.rapidapi.com/v2/video/details',
+        params: { videoId: videoId },
+        headers: {
+          'x-rapidapi-key': RAPID_API_KEY,
+          'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
+        }
+      };
+
+      const response = await axios.request(options);
+      const data = response.data;
+
+      if (!data || !data.videos) {
+          throw new Error('API-ul nu a returnat video-uri valide.');
       }
-  } catch (e) {
-      // Ignorăm eroarea de titlu, nu e critică
-  }
 
-  // 2. Lista serverelor CARE MERG (Testate)
-  // co.wuk.sh este cel mai bazat server comunitar
-  const SERVERS = [
-      'https://co.wuk.sh',             // Principalul (v7/v10)
-      'https://api.cobalt.kwiatekmiki.pl', // Backup 1
-      'https://cobalt.xyvs.com'        // Backup 2
-  ];
+      // Căutăm cea mai bună calitate cu sunet (items)
+      // API-ul returnează o listă "items". Căutăm 1080p sau 720p mp4.
+      const videos = data.videos.items;
+      
+      // Filtrăm doar MP4 care au audio (unele sunt video-only)
+      // RapidAPI notează de obicei hasAudio: true sau similar, dar acest API specific
+      // returnează linkuri combinate în "items".
+      
+      let selectedVideo = videos.find(v => v.quality === '1080p' && v.extension === 'mp4') ||
+                          videos.find(v => v.quality === '720p' && v.extension === 'mp4') ||
+                          videos.find(v => v.quality === '480p' && v.extension === 'mp4') ||
+                          videos[0]; // Fallback la primul găsit
 
-  for (const baseDomain of SERVERS) {
-      try {
-          console.log(`[Downloader] Încerc pe: ${baseDomain}...`);
-          
-          // Configurăm un payload "hibrid" care merge și pe v7 și pe v10
-          const payload = {
-              url: url,
-              // Parametri stil vechi (v7)
-              vQuality: '1080',
-              filenamePattern: 'basic',
-              // Parametri stil nou (v10)
-              videoQuality: '1080',
-              filenameStyle: 'basic',
-              // Comuni
-              aFormat: 'mp3',
-              audioFormat: 'mp3',
-              isAudioOnly: false,
-              downloadMode: 'auto'
-          };
-
-          const headers = {
-              'Accept': 'application/json',
-              'Content-Type': 'application/json',
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
-          };
-
-          // Încercăm întâi endpoint-ul /api/json (cel mai comun pentru wuk.sh)
-          let response;
-          try {
-             response = await axios.post(`${baseDomain}/api/json`, payload, { headers, timeout: 15000 });
-          } catch(err1) {
-             // Dacă /api/json nu merge, încercăm rădăcina / (pentru serverele v10 pure)
-             console.log(`[Downloader] /api/json a eșuat, încerc root / pe ${baseDomain}`);
-             response = await axios.post(`${baseDomain}/`, payload, { headers, timeout: 15000 });
-          }
-
-          const data = response.data;
-
-          // Verificăm dacă am primit ceva util
-          if (data && (data.status === 'stream' || data.status === 'redirect' || data.status === 'picker')) {
-              
-              let finalUrl = data.url;
-              // Dacă ne dă picker (mai multe opțiuni), luăm prima
-              if (data.status === 'picker' && data.picker && data.picker.length > 0) {
-                  finalUrl = data.picker[0].url;
-              }
-
-              if (finalUrl) {
-                  console.log('[Downloader] REUȘITĂ pe:', baseDomain);
-                  return res.json({
-                      success: true,
-                      downloadUrl: finalUrl,
-                      title: metaData.title,
-                      thumbnail: metaData.thumbnail,
-                      quality: 'HD'
-                  });
-              }
-          }
-      } catch (err) {
-          // Doar logăm scurt și trecem la următorul server
-          console.warn(`[Downloader] Eșec pe ${baseDomain}: ${err.message}`);
+      if (!selectedVideo) {
+          return res.json({ success: false, error: 'Nu am găsit un link de download valid.' });
       }
-  }
 
-  // Dacă am ajuns aici, e grav, dar măcar știm de ce
-  console.error('[Downloader] Toate serverele sunt down.');
-  res.status(500).json({ success: false, error: 'Serverele de download sunt ocupate momentan.' });
+      console.log(`[Downloader] Succes! Calitate: ${selectedVideo.quality}`);
+
+      res.json({
+          success: true,
+          downloadUrl: selectedVideo.url,
+          title: data.title || 'YouTube Video',
+          thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
+          quality: selectedVideo.quality
+      });
+
+  } catch (error) {
+      console.error('[Downloader] RapidAPI Error:', error.response ? error.response.data : error.message);
+      
+      // Mesaj specific dacă ai consumat limita gratuită
+      if (error.response && error.response.status === 429) {
+          return res.status(429).json({ success: false, error: 'Limita zilnică de download-uri a fost atinsă.' });
+      }
+
+      res.status(500).json({ success: false, error: 'Eroare la procesarea video-ului.' });
+  }
 });
