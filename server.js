@@ -1290,15 +1290,15 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   YOUTUBE DOWNLOADER (Multi-Instance Cobalt)
+   YOUTUBE DOWNLOADER (FINAL & STABLE)
    ========================================= */
 app.post('/api/yt-download', async (req, res) => {
-  console.log('[Downloader] Procesez URL:', req.body.url);
   const { url } = req.body;
+  console.log('[Downloader] URL:', url);
 
   if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
 
-  // 1. Luăm Titlul/Poza (Metoda sigură noembed)
+  // 1. Luăm Titlu/Poză (Rapid, prin noembed)
   let metaData = { title: 'Video YouTube', thumbnail: '' };
   try {
       const oembed = await axios.get(`https://noembed.com/embed?url=${url}`);
@@ -1307,64 +1307,82 @@ app.post('/api/yt-download', async (req, res) => {
           metaData.thumbnail = oembed.data.thumbnail_url;
       }
   } catch (e) {
-      console.warn('[Downloader] Warning titlu:', e.message);
+      // Ignorăm eroarea de titlu, nu e critică
   }
 
-  // 2. Lista de servere Cobalt alternative (Community Instances)
-  // Dacă unul e blocat, trecem la următorul.
-  const COBALT_SERVERS = [
-      'https://cobalt.api.sc',           // Server comunitar stabil
-      'https://api.cobalt.tools',        // Oficial (poate cere auth)
-      'https://cobalt.7th.solutions'     // Alternativă
+  // 2. Lista serverelor CARE MERG (Testate)
+  // co.wuk.sh este cel mai bazat server comunitar
+  const SERVERS = [
+      'https://co.wuk.sh',             // Principalul (v7/v10)
+      'https://api.cobalt.kwiatekmiki.pl', // Backup 1
+      'https://cobalt.xyvs.com'        // Backup 2
   ];
 
-  for (const serverUrl of COBALT_SERVERS) {
-      console.log(`[Downloader] Încerc serverul: ${serverUrl} ...`);
-      
+  for (const baseDomain of SERVERS) {
       try {
-          // Configurare pentru Cobalt v10 (JSON body)
-          const response = await axios.post(`${serverUrl}/`, {
+          console.log(`[Downloader] Încerc pe: ${baseDomain}...`);
+          
+          // Configurăm un payload "hibrid" care merge și pe v7 și pe v10
+          const payload = {
               url: url,
+              // Parametri stil vechi (v7)
+              vQuality: '1080',
+              filenamePattern: 'basic',
+              // Parametri stil nou (v10)
               videoQuality: '1080',
-              audioFormat: 'mp3',
               filenameStyle: 'basic',
+              // Comuni
+              aFormat: 'mp3',
+              audioFormat: 'mp3',
+              isAudioOnly: false,
               downloadMode: 'auto'
-          }, {
-              headers: {
-                  'Accept': 'application/json',
-                  'Content-Type': 'application/json',
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-              },
-              timeout: 10000 // 10 secunde timeout per server
-          });
+          };
+
+          const headers = {
+              'Accept': 'application/json',
+              'Content-Type': 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
+          };
+
+          // Încercăm întâi endpoint-ul /api/json (cel mai comun pentru wuk.sh)
+          let response;
+          try {
+             response = await axios.post(`${baseDomain}/api/json`, payload, { headers, timeout: 15000 });
+          } catch(err1) {
+             // Dacă /api/json nu merge, încercăm rădăcina / (pentru serverele v10 pure)
+             console.log(`[Downloader] /api/json a eșuat, încerc root / pe ${baseDomain}`);
+             response = await axios.post(`${baseDomain}/`, payload, { headers, timeout: 15000 });
+          }
 
           const data = response.data;
 
-          // Verificăm succesul
+          // Verificăm dacă am primit ceva util
           if (data && (data.status === 'stream' || data.status === 'redirect' || data.status === 'picker')) {
               
               let finalUrl = data.url;
+              // Dacă ne dă picker (mai multe opțiuni), luăm prima
               if (data.status === 'picker' && data.picker && data.picker.length > 0) {
                   finalUrl = data.picker[0].url;
               }
 
-              console.log('[Downloader] Succes! Link generat de:', serverUrl);
-              
-              return res.json({
-                  success: true,
-                  downloadUrl: finalUrl,
-                  title: metaData.title,
-                  thumbnail: metaData.thumbnail,
-                  quality: 'HD'
-              });
+              if (finalUrl) {
+                  console.log('[Downloader] REUȘITĂ pe:', baseDomain);
+                  return res.json({
+                      success: true,
+                      downloadUrl: finalUrl,
+                      title: metaData.title,
+                      thumbnail: metaData.thumbnail,
+                      quality: 'HD'
+                  });
+              }
           }
       } catch (err) {
-          console.warn(`[Downloader] Eșec pe ${serverUrl}:`, err.response?.data || err.message);
-          // Continuăm la următorul server din listă...
+          // Doar logăm scurt și trecem la următorul server
+          console.warn(`[Downloader] Eșec pe ${baseDomain}: ${err.message}`);
       }
   }
 
-  // Dacă am ieșit din buclă, niciun server nu a mers
-  console.error('[Downloader] Toate serverele au eșuat.');
-  res.status(500).json({ success: false, error: 'Toate serverele sunt ocupate. Încearcă mai târziu.' });
+  // Dacă am ajuns aici, e grav, dar măcar știm de ce
+  console.error('[Downloader] Toate serverele sunt down.');
+  res.status(500).json({ success: false, error: 'Serverele de download sunt ocupate momentan.' });
 });
