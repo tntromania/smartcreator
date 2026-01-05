@@ -1290,10 +1290,11 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   YOUTUBE DOWNLOADER (Via RAPIDAPI - FIXED)
+   SMART DOWNLOADER (Video + Transcript)
    ========================================= */
+const { YoutubeTranscript } = require('youtube-transcript'); // ✅ Importăm librăria nouă
 
-// Funcție helper pentru a extrage ID-ul corect (API-ul cere ID, nu URL)
+// Helper ID
 function extractVideoId(url) {
     const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
     return match ? match[1] : null;
@@ -1301,67 +1302,79 @@ function extractVideoId(url) {
 
 app.post('/api/yt-download', async (req, res) => {
   const { url } = req.body;
-  console.log('[Downloader] Procesez URL:', url);
+  console.log('[SmartDownloader] URL:', url);
 
   if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
 
   const videoId = extractVideoId(url);
-  if (!videoId) {
-      return res.status(400).json({ success: false, error: 'Link YouTube invalid' });
-  }
+  if (!videoId) return res.status(400).json({ success: false, error: 'Link invalid' });
 
-  // ✅ AICI ESTE CHEIA TA (Fără blocul IF care te bloca)
+  // 🔑 CHEIA TA RAPIDAPI
   const RAPID_API_KEY = '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3'; 
 
   try {
-      console.log(`[Downloader] Cerere RapidAPI pentru ID: ${videoId}`);
+      // --- 1. OBTINEM TRANSCRIPTUL (Paralel) ---
+      // Folosim un Promise.allSettled ca să nu crăpe totul dacă video-ul nu are subtitrări
+      const [transcriptResult, videoResult] = await Promise.allSettled([
+          YoutubeTranscript.fetchTranscript(videoId),
+          axios.request({
+            method: 'GET',
+            url: 'https://youtube-media-downloader.p.rapidapi.com/v2/video/details',
+            params: { videoId: videoId },
+            headers: {
+              'x-rapidapi-key': RAPID_API_KEY,
+              'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
+            }
+          })
+      ]);
 
-      const options = {
-        method: 'GET',
-        url: 'https://youtube-media-downloader.p.rapidapi.com/v2/video/details',
-        params: { videoId: videoId },
-        headers: {
-          'x-rapidapi-key': RAPID_API_KEY,
-          'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
-        }
-      };
-
-      const response = await axios.request(options);
-      const data = response.data;
-
-      if (!data || !data.videos) {
-          throw new Error('API-ul nu a returnat video-uri valide.');
+      // --- 2. PROCESAM VIDEO-UL ---
+      if (videoResult.status === 'rejected' || !videoResult.value.data.videos) {
+          throw new Error('Eroare la obținerea video-ului.');
       }
-
-      // Căutăm cea mai bună calitate MP4
-      const videos = data.videos.items;
       
-      let selectedVideo = videos.find(v => v.quality === '1080p' && v.extension === 'mp4') ||
-                          videos.find(v => v.quality === '720p' && v.extension === 'mp4') ||
-                          videos.find(v => v.quality === '480p' && v.extension === 'mp4') ||
-                          videos[0]; // Fallback la primul găsit
+      const data = videoResult.value.data;
+      const videos = data.videos.items;
 
-      if (!selectedVideo) {
-          return res.json({ success: false, error: 'Nu am găsit un link de download valid.' });
+      // Logică avansată pentru a găsi cea mai bună calitate CU SUNET
+      // Multe API-uri dau 1080p FĂRĂ sunet. Verificăm proprietatea 'hasAudio' dacă există, sau presupunem că mp4 e ok.
+      
+      let selectedVideo = 
+          // Încercăm 1080p
+          videos.find(v => v.quality === '1080p' && v.extension === 'mp4' && v.hasAudio !== false) ||
+          // Fallback la 720p (cel mai sigur HD)
+          videos.find(v => v.quality === '720p' && v.extension === 'mp4') ||
+          // Orice altceva
+          videos[0];
+
+      if (!selectedVideo) throw new Error('Nu am găsit link valid.');
+
+      // --- 3. PROCESAM TRANSCRIPTUL ---
+      let transcriptText = null;
+      if (transcriptResult.status === 'fulfilled') {
+          // Librăria returnează un array de obiecte {text, duration, offset}. 
+          // Le unim într-un text lung.
+          transcriptText = transcriptResult.value.map(item => item.text).join(' ');
+          // Curățăm caracterele HTML (ex: &amp;)
+          transcriptText = transcriptText.replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+      } else {
+          console.warn('[Transcript] Nu există subtitrări:', transcriptResult.reason?.message);
       }
 
-      console.log(`[Downloader] Succes! Calitate: ${selectedVideo.quality}`);
+      console.log(`[Success] Video: ${selectedVideo.quality} | Transcript: ${transcriptText ? 'DA' : 'NU'}`);
 
+      // Trimitem totul la frontend
       res.json({
           success: true,
           downloadUrl: selectedVideo.url,
           title: data.title || 'YouTube Video',
           thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
-          quality: selectedVideo.quality
+          quality: selectedVideo.quality,
+          transcript: transcriptText // Trimitem și textul
       });
 
   } catch (error) {
-      console.error('[Downloader] RapidAPI Error:', error.response ? error.response.data : error.message);
-      
-      if (error.response && error.response.status === 429) {
-          return res.status(429).json({ success: false, error: 'Limita zilnică de download-uri a fost atinsă.' });
-      }
-
-      res.status(500).json({ success: false, error: 'Eroare la procesarea video-ului.' });
+      console.error('[Eroare Server]:', error.message);
+      res.status(500).json({ success: false, error: 'Eroare la procesare.' });
   }
 });
