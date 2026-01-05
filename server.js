@@ -1317,21 +1317,37 @@ function cleanTranscriptXML(xmlData) {
 }
 
 /* =========================================
-   SMART DOWNLOADER (Logică Îmbunătățită Calitate)
+   SMART DOWNLOADER (Listă Formate + Transcript)
    ========================================= */
 
-// ... (păstrează funcțiile helper extractVideoId și cleanTranscriptXML de sus) ...
+// Helper pentru ID
+function extractVideoId(url) {
+    const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
+    return match ? match[1] : null;
+}
+
+// Helper curățare transcript
+function cleanTranscriptXML(xmlData) {
+    if (!xmlData) return '';
+    if (!xmlData.includes('<text')) return xmlData;
+    return xmlData
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+        .trim();
+}
 
 app.post('/api/yt-download', async (req, res) => {
   const { url } = req.body;
-  console.log('[SmartDownloader] Procesez URL:', url);
+  console.log('[SmartDownloader] URL:', url);
 
   if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
 
   const videoId = extractVideoId(url);
   if (!videoId) return res.status(400).json({ success: false, error: 'Link invalid' });
 
-  // 🔑 CHEIA TA RAPIDAPI
   const RAPID_API_KEY = '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3'; 
 
   try {
@@ -1348,27 +1364,28 @@ app.post('/api/yt-download', async (req, res) => {
       const data = response.data;
       if (!data || !data.videos) throw new Error('API-ul nu a returnat date.');
 
-      const videos = data.videos.items;
+      // --- LOGICĂ NOUĂ: Colectăm TOATE formatele bune ---
+      const allVideos = data.videos.items;
       
-      // --- DEBUG: Vedem ce calități primim de fapt ---
-      console.log('[Debug Qualities]:', videos.map(v => `${v.quality} (${v.extension}) Audio:${v.hasAudio}`));
+      // Filtrăm doar MP4 care AU sunet (hasAudio: true sau undefined)
+      // Eliminăm duplicatele de calitate (păstrăm doar una per rezoluție)
+      const validFormats = allVideos
+          .filter(v => v.extension === 'mp4' && v.hasAudio !== false)
+          .map(v => ({
+              quality: v.quality,
+              url: v.url,
+              hasAudio: true,
+              size: v.sizeText || ''
+          }));
 
-      // --- LOGICĂ NOUĂ MAI FLEXIBILĂ ---
-      // Căutăm orice string care conține "1080" (ex: "1080p", "hd1080", "1080")
-      // ȘI care are extensia mp4
-      // ȘI care nu are explicit hasAudio: false
-      
-      let selectedVideo = 
-          videos.find(v => v.quality.includes('1080') && v.extension === 'mp4' && v.hasAudio !== false) ||
-          videos.find(v => v.quality.includes('720') && v.extension === 'mp4' && v.hasAudio !== false) ||
-          videos.find(v => v.quality.includes('480') && v.extension === 'mp4' && v.hasAudio !== false) ||
-          videos[0];
+      // Dacă nu găsim nimic cu sunet, luăm tot ce e mp4 (fallback)
+      const finalFormats = validFormats.length > 0 ? validFormats : allVideos.filter(v => v.extension === 'mp4');
 
-      if (!selectedVideo) throw new Error('Nu am găsit link video.');
+      if (finalFormats.length === 0) throw new Error('Nu am găsit formate video valide.');
 
-      // --- LOGICĂ TRANSCRIPT (Neschimbată) ---
+      // --- LOGICĂ TRANSCRIPT ---
       let transcriptText = null;
-      if (data.subtitles && data.subtitles.items && data.subtitles.items.length > 0) {
+      if (data.subtitles && data.subtitles.items) {
           const subs = data.subtitles.items;
           const targetSub = subs.find(s => s.code === 'ro' || (s.name && s.name.toLowerCase().includes('romanian'))) || 
                             subs.find(s => s.code === 'en' || (s.name && s.name.toLowerCase().includes('english'))) || 
@@ -1378,28 +1395,22 @@ app.post('/api/yt-download', async (req, res) => {
               try {
                   const subRes = await axios.get(targetSub.url);
                   transcriptText = cleanTranscriptXML(subRes.data);
-              } catch (err) {
-                  console.warn('[Transcript] Eroare download:', err.message);
-              }
+              } catch (err) {}
           }
       }
 
-      console.log(`[Success] Video: ${selectedVideo.quality} | Transcript: ${transcriptText ? 'DA' : 'NU'}`);
+      console.log(`[Success] Găsite ${finalFormats.length} formate. Transcript: ${transcriptText ? 'DA' : 'NU'}`);
 
       res.json({
           success: true,
-          downloadUrl: selectedVideo.url,
           title: data.title || 'YouTube Video',
           thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
-          quality: selectedVideo.quality, // Trimitem calitatea exactă găsită
+          formats: finalFormats, // Trimitem LISTA de formate, nu doar unul
           transcript: transcriptText
       });
 
   } catch (error) {
-      console.error('[Eroare Server]:', error.response ? error.response.data : error.message);
-      if (error.response && error.response.status === 429) {
-          return res.status(429).json({ success: false, error: 'Limita zilnică RapidAPI atinsă.' });
-      }
+      console.error('[Eroare Server]:', error.message);
       res.status(500).json({ success: false, error: 'Eroare procesare video.' });
   }
 });
