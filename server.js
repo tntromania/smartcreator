@@ -1290,7 +1290,7 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   YOUTUBE DOWNLOADER (Via RAPIDAPI)
+   YOUTUBE DOWNLOADER (Via RAPIDAPI - FIXED)
    ========================================= */
 
 // Funcție helper pentru a extrage ID-ul corect (API-ul cere ID, nu URL)
@@ -1310,13 +1310,8 @@ app.post('/api/yt-download', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Link YouTube invalid' });
   }
 
-  // 🔴 PUNE CHEIA TA AICI (între ghilimele)
+  // ✅ AICI ESTE CHEIA TA (Fără blocul IF care te bloca)
   const RAPID_API_KEY = '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3'; 
-
-  if (RAPID_API_KEY === '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3') {
-      console.error('[Downloader] Cheia RapidAPI lipsește!');
-      return res.status(500).json({ success: false, error: 'Serverul nu este configurat (lipsește API Key).' });
-  }
 
   try {
       console.log(`[Downloader] Cerere RapidAPI pentru ID: ${videoId}`);
@@ -1338,13 +1333,8 @@ app.post('/api/yt-download', async (req, res) => {
           throw new Error('API-ul nu a returnat video-uri valide.');
       }
 
-      // Căutăm cea mai bună calitate cu sunet (items)
-      // API-ul returnează o listă "items". Căutăm 1080p sau 720p mp4.
+      // Căutăm cea mai bună calitate MP4
       const videos = data.videos.items;
-      
-      // Filtrăm doar MP4 care au audio (unele sunt video-only)
-      // RapidAPI notează de obicei hasAudio: true sau similar, dar acest API specific
-      // returnează linkuri combinate în "items".
       
       let selectedVideo = videos.find(v => v.quality === '1080p' && v.extension === 'mp4') ||
                           videos.find(v => v.quality === '720p' && v.extension === 'mp4') ||
@@ -1368,7 +1358,6 @@ app.post('/api/yt-download', async (req, res) => {
   } catch (error) {
       console.error('[Downloader] RapidAPI Error:', error.response ? error.response.data : error.message);
       
-      // Mesaj specific dacă ai consumat limita gratuită
       if (error.response && error.response.status === 429) {
           return res.status(429).json({ success: false, error: 'Limita zilnică de download-uri a fost atinsă.' });
       }
