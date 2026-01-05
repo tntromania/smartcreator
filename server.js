@@ -1292,7 +1292,6 @@ if (msg?.type === 'global-notification') {
 /* =========================================
    SMART DOWNLOADER (RapidAPI: Video + Subs)
    ========================================= */
-const axios = require('axios'); // Asigură-te că ai axios importat sus
 
 // Helper pentru ID
 function extractVideoId(url) {
