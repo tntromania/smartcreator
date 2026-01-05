@@ -1289,11 +1289,6 @@ if (msg?.type === 'global-notification') {
   });
 });
 
-// La început, asigură-te că ai:
-const axios = require('axios');
-
-// Apoi, undeva după alte rute (app.get, app.post), adaugă:
-
 app.post('/api/yt-download', async (req, res) => {
   try {
     const { url } = req.body;
