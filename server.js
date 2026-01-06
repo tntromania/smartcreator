@@ -1290,7 +1290,7 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   🔻 YOUTUBE DOWNLOADER PRO (FINAL FIX) 🔻
+   🔻 YOUTUBE DOWNLOADER PRO (CONVERSION API) 🔻
    ========================================= */
 
 // 1. Helper ID
@@ -1312,7 +1312,7 @@ function cleanTranscriptXML(xmlData) {
         .trim();
 }
 
-// 3. ENDPOINT PRINCIPAL - CU TRANSCRIPT INCLUS
+// 3. ENDPOINT PRINCIPAL - Obține info + link de conversie
 app.post('/api/yt-download', async (req, res) => {
   const { url } = req.body;
   console.log('[SmartDownloader] Procesez URL:', url);
@@ -1323,7 +1323,7 @@ app.post('/api/yt-download', async (req, res) => {
   if (!videoId) return res.status(400).json({ success: false, error: 'Link invalid' });
 
   try {
-      // Cerere către RapidAPI
+      // Cerere către RapidAPI pentru informații
       const response = await axios.get('https://youtube-media-downloader.p.rapidapi.com/v2/video/details', {
         params: { videoId: videoId },
         headers: {
@@ -1349,12 +1349,12 @@ app.post('/api/yt-download', async (req, res) => {
                   qualityLabel: v.quality || `${resolution}p`,
                   url: v.url,
                   size: v.sizeText || 'MP4',
-                  resolution: resolution
+                  resolution: resolution,
+                  itag: v.itag || null
               };
           })
           .filter(v => v.resolution > 0);
 
-      // Eliminăm duplicatele
       const uniqueFormats = [];
       const seenResolutions = new Set();
       
@@ -1371,7 +1371,7 @@ app.post('/api/yt-download', async (req, res) => {
 
       console.log(`[Success] ${uniqueFormats.length} rezoluții: ${uniqueFormats.map(f => f.qualityLabel).join(', ')}`);
 
-      // --- TRANSCRIPT (încărcare paralelă) ---
+      // --- TRANSCRIPT ---
       let transcriptText = null;
       if (data.subtitles && data.subtitles.items && data.subtitles.items.length > 0) {
           const subs = data.subtitles.items;
@@ -1389,10 +1389,11 @@ app.post('/api/yt-download', async (req, res) => {
           }
       }
 
-      // Trimitem răspunsul complet
+      // Trimitem răspunsul
       res.json({
           success: true,
           videoId: videoId,
+          videoUrl: url,
           title: data.title || 'YouTube Video',
           thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
           duration: data.lengthSeconds ? new Date(data.lengthSeconds * 1000).toISOString().substr(14, 5) : '',
@@ -1406,5 +1407,99 @@ app.post('/api/yt-download', async (req, res) => {
           return res.status(429).json({ success: false, error: 'Limita zilnică RapidAPI atinsă.' });
       }
       res.status(500).json({ success: false, error: 'Eroare procesare video.' });
+  }
+});
+
+// 4. ENDPOINT pentru generare link de download via API extern
+app.post('/api/generate-download', async (req, res) => {
+  const { videoUrl, quality } = req.body;
+
+  try {
+    // Folosim un API de conversie gratuit (ex: y2mate, loader.to, etc.)
+    // IMPORTANT: Acesta e un exemplu - trebuie să te înregistrezi pentru API key
+    
+    const conversionAPI = await axios.post('https://youtube-mp36.p.rapidapi.com/dl', {
+      id: extractVideoId(videoUrl)
+    }, {
+      headers: {
+        'x-rapidapi-key': '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3',
+        'x-rapidapi-host': 'youtube-mp36.p.rapidapi.com'
+      },
+      timeout: 15000
+    });
+
+    if (conversionAPI.data && conversionAPI.data.link) {
+      res.json({
+        success: true,
+        downloadUrl: conversionAPI.data.link
+      });
+    } else {
+      throw new Error('Nu s-a putut genera link-ul de download');
+    }
+
+  } catch (error) {
+    console.error('[Conversion Error]:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Eroare la generarea link-ului de download' 
+    });
+  }
+});
+
+// 5. ALTERNATIVĂ: Download direct prin server (cu cache și optimizări)
+app.get('/api/download-video', async (req, res) => {
+  try {
+    const videoUrl = req.query.url;
+    const title = req.query.title || 'video';
+
+    if (!videoUrl) return res.status(400).send('URL lipsă');
+
+    const safeTitle = title.replace(/[^a-z0-9\s\-_]/gi, '').trim().substring(0, 50) || 'video';
+
+    // Headers optimizate pentru YouTube
+    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    // Streaming optimizat
+    const response = await axios({
+      method: 'GET',
+      url: videoUrl,
+      responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.youtube.com/',
+        'Origin': 'https://www.youtube.com',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'video',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site'
+      },
+      maxRedirects: 5,
+      timeout: 30000
+    });
+
+    // Forward content length if available
+    if (response.headers['content-length']) {
+      res.setHeader('Content-Length', response.headers['content-length']);
+    }
+
+    response.data.pipe(res);
+
+    response.data.on('error', (err) => {
+      console.error('[Stream Error]:', err.message);
+      if (!res.headersSent) {
+        res.status(500).send('Eroare la transfer.');
+      }
+    });
+
+  } catch (error) {
+    console.error('[Download Error]:', error.message);
+    if (!res.headersSent) {
+      res.status(500).send('Link expirat sau blocat de YouTube.');
+    }
   }
 });
