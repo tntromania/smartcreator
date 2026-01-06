@@ -1292,25 +1292,6 @@ if (msg?.type === 'global-notification') {
 /* =========================================
    🔻 YOUTUBE DOWNLOADER - YT-DLP VERSION 🔻
    ========================================= */
-
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const { exec } = require('child_process');
-const { promisify } = require('util');
-const fs = require('fs');
-const path = require('path');
-
-const execPromise = promisify(exec);
-const app = express();
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static('public'));
-
-const PORT = process.env.PORT || 3000;
-
 // Directory pentru fișiere temporare
 const TEMP_DIR = path.join(__dirname, 'temp');
 if (!fs.existsSync(TEMP_DIR)) {
