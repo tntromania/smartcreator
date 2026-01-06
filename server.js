@@ -1290,7 +1290,7 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   🔻 YOUTUBE DOWNLOADER PRO (FIXED) 🔻
+   🔻 YOUTUBE DOWNLOADER PRO (FIXED V2) 🔻
    ========================================= */
 
 // 1. Helper ID
@@ -1330,16 +1330,16 @@ app.post('/api/yt-download', async (req, res) => {
           'x-rapidapi-key': '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3',
           'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
         },
-        timeout: 15000 // 15 secunde timeout
+        timeout: 15000
       });
 
       const data = response.data;
       if (!data || !data.videos) throw new Error('API-ul nu a returnat date.');
 
-      // --- FILTRARE CALITĂȚI (ÎMBUNĂTĂȚITĂ) ---
+      // --- FILTRARE CALITĂȚI (COMPLETĂ) ---
       const allVideos = data.videos.items;
       
-      // Prioritizăm formatele care au audio și sunt mp4
+      // Colectăm TOATE formatele MP4 (cu sau fără audio explicit)
       let validFormats = allVideos
           .filter(v => v.extension === 'mp4')
           .map(v => {
@@ -1352,7 +1352,7 @@ app.post('/api/yt-download', async (req, res) => {
                   url: v.url,
                   size: v.sizeText || 'MP4',
                   resolution: resolution,
-                  hasAudio: v.hasAudio // păstrăm info despre audio
+                  hasAudio: v.hasAudio
               };
           })
           .filter(v => v.resolution > 0); // eliminăm formatele fără rezoluție validă
@@ -1368,14 +1368,14 @@ app.post('/api/yt-download', async (req, res) => {
           }
       }
 
-      // Sortăm descrescător (1080p → 720p → 480p → 360p → 144p)
+      // Sortăm descrescător (1080p → 720p → 480p → 360p → 240p → 144p)
       uniqueFormats.sort((a, b) => b.resolution - a.resolution);
 
       if (uniqueFormats.length === 0) throw new Error('Nu am găsit formate video valide.');
 
-      console.log(`[Success] Trimitem ${uniqueFormats.length} opțiuni de calitate.`);
+      console.log(`[Success] Găsite ${uniqueFormats.length} rezoluții: ${uniqueFormats.map(f => f.qualityLabel).join(', ')}`);
 
-      // --- TRANSCRIPT (cu optimizare) ---
+      // --- TRANSCRIPT ---
       let transcriptText = null;
       if (data.subtitles && data.subtitles.items && data.subtitles.items.length > 0) {
           const subs = data.subtitles.items;
@@ -1396,10 +1396,11 @@ app.post('/api/yt-download', async (req, res) => {
       // Trimitem răspunsul către Frontend
       res.json({
           success: true,
+          videoId: videoId,
           title: data.title || 'YouTube Video',
           thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
           duration: data.lengthSeconds ? new Date(data.lengthSeconds * 1000).toISOString().substr(14, 5) : '',
-          formats: uniqueFormats, // LISTA COMPLETĂ DE FORMATE
+          formats: uniqueFormats,
           transcript: transcriptText
       });
 
@@ -1415,50 +1416,25 @@ app.post('/api/yt-download', async (req, res) => {
   }
 });
 
-// 4. ENDPOINT STREAMING (ÎMBUNĂTĂȚIT - cu User-Agent și Headers)
-app.get('/api/stream-download', async (req, res) => {
+// 4. ENDPOINT PROXY DOWNLOAD (cu redirect către link direct)
+// Această metodă NU mai face streaming prin server, ci trimite link-ul direct către client
+app.get('/api/get-download-link', async (req, res) => {
   try {
     const videoUrl = req.query.url;
-    const title = req.query.title || 'video';
+    
+    if (!videoUrl) {
+      return res.status(400).json({ success: false, error: 'URL lipsă' });
+    }
 
-    if (!videoUrl) return res.status(400).send('Lipsă URL');
-
-    const safeTitle = title.replace(/[^a-z0-9\s\-_]/gi, '').trim().substring(0, 50) || 'video';
-
-    // Setăm headerele pentru download
-    res.header('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
-    res.header('Content-Type', 'video/mp4');
-
-    // REQUEST către YouTube cu headers corecte
-    const response = await axios({
-      method: 'get',
-      url: videoUrl,
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com'
-      },
-      timeout: 30000 // 30 secunde pentru conexiune
-    });
-
-    // Streaming către client
-    response.data.pipe(res);
-
-    // Handling erori de streaming
-    response.data.on('error', (err) => {
-      console.error('[Stream Pipe Error]', err.message);
-      if (!res.headersSent) {
-        res.status(500).send('Eroare la transfer video.');
-      }
+    // Returnăm JSON cu link-ul direct - browserul va deschide descărcarea
+    res.json({
+      success: true,
+      downloadUrl: videoUrl,
+      message: 'Link pregătit pentru descărcare'
     });
 
   } catch (error) {
-    console.error('[Stream Error]', error.message);
-    if (!res.headersSent) {
-      res.status(500).send('Eroare la descărcare. Link-ul poate fi expirat.');
-    }
+    console.error('[Error]', error.message);
+    res.status(500).json({ success: false, error: 'Eroare la generare link.' });
   }
 });
