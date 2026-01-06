@@ -1327,7 +1327,7 @@ app.post('/api/yt-download', async (req, res) => {
       const response = await axios.get('https://youtube-media-downloader.p.rapidapi.com/v2/video/details', {
         params: { videoId: videoId },
         headers: {
-          'x-rapidapi-key': RAPID_API_KEY,
+          'x-rapidapi-key': 7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3,
           'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
         }
       });
