@@ -1290,29 +1290,73 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   🔻 YOUTUBE DOWNLOADER PRO (CONVERSION API) 🔻
+   🔻 YOUTUBE DOWNLOADER - YT-DLP VERSION 🔻
    ========================================= */
 
-// 1. Helper ID
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs');
+const path = require('path');
+
+const execPromise = promisify(exec);
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+
+const PORT = process.env.PORT || 3000;
+
+// Directory pentru fișiere temporare
+const TEMP_DIR = path.join(__dirname, 'temp');
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+// Cleanup fișiere vechi (mai vechi de 1 oră)
+setInterval(() => {
+  fs.readdir(TEMP_DIR, (err, files) => {
+    if (err) return;
+    files.forEach(file => {
+      const filePath = path.join(TEMP_DIR, file);
+      fs.stat(filePath, (err, stats) => {
+        if (err) return;
+        const now = Date.now();
+        const fileAge = now - stats.mtimeMs;
+        if (fileAge > 3600000) { // 1 oră
+          fs.unlink(filePath, () => {});
+        }
+      });
+    });
+  });
+}, 600000); // Check la fiecare 10 minute
+
+// ===== HELPER FUNCTIONS =====
+
 function extractVideoId(url) {
-    const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
-    return match ? match[1] : null;
+  const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
+  return match ? match[1] : null;
 }
 
-// 2. Helper Transcript
 function cleanTranscriptXML(xmlData) {
-    if (!xmlData) return '';
-    if (!xmlData.includes('<text')) return xmlData;
-    return xmlData
-        .replace(/<[^>]*>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/&#39;/g, "'")
-        .replace(/&quot;/g, '"')
-        .trim();
+  if (!xmlData) return '';
+  if (!xmlData.includes('<text')) return xmlData;
+  return xmlData
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .trim();
 }
 
-// 3. ENDPOINT PRINCIPAL - Obține info + link de conversie
+// ===== ENDPOINTS =====
+
+// 1. Obține informații despre video (rapid, fără download)
 app.post('/api/yt-download', async (req, res) => {
   const { url } = req.body;
   console.log('[SmartDownloader] Procesez URL:', url);
@@ -1323,174 +1367,150 @@ app.post('/api/yt-download', async (req, res) => {
   if (!videoId) return res.status(400).json({ success: false, error: 'Link invalid' });
 
   try {
-      // Cerere către RapidAPI pentru informații
-      const response = await axios.get('https://youtube-media-downloader.p.rapidapi.com/v2/video/details', {
-        params: { videoId: videoId },
-        headers: {
-          'x-rapidapi-key': '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3',
-          'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
-        },
-        timeout: 12000
-      });
-
-      const data = response.data;
-      if (!data || !data.videos) throw new Error('API-ul nu a returnat date.');
-
-      // --- FILTRARE CALITĂȚI ---
-      const allVideos = data.videos.items;
-      
-      let validFormats = allVideos
-          .filter(v => v.extension === 'mp4')
-          .map(v => {
-              const resMatch = v.quality?.match(/(\d+)p?/);
-              const resolution = resMatch ? parseInt(resMatch[1]) : 0;
-              
-              return {
-                  qualityLabel: v.quality || `${resolution}p`,
-                  url: v.url,
-                  size: v.sizeText || 'MP4',
-                  resolution: resolution,
-                  itag: v.itag || null
-              };
-          })
-          .filter(v => v.resolution > 0);
-
-      const uniqueFormats = [];
-      const seenResolutions = new Set();
-      
-      for (const format of validFormats) {
-          if (!seenResolutions.has(format.resolution)) {
-              seenResolutions.add(format.resolution);
-              uniqueFormats.push(format);
-          }
-      }
-
-      uniqueFormats.sort((a, b) => b.resolution - a.resolution);
-
-      if (uniqueFormats.length === 0) throw new Error('Nu am găsit formate video valide.');
-
-      console.log(`[Success] ${uniqueFormats.length} rezoluții: ${uniqueFormats.map(f => f.qualityLabel).join(', ')}`);
-
-      // --- TRANSCRIPT ---
-      let transcriptText = null;
-      if (data.subtitles && data.subtitles.items && data.subtitles.items.length > 0) {
-          const subs = data.subtitles.items;
-          const targetSub = subs.find(s => s.code === 'ro' || (s.name && s.name.toLowerCase().includes('romanian'))) || 
-                            subs.find(s => s.code === 'en' || (s.name && s.name.toLowerCase().includes('english'))) || 
-                            subs[0];
-
-          if (targetSub && targetSub.url) {
-              try {
-                  const subRes = await axios.get(targetSub.url, { timeout: 5000 });
-                  transcriptText = cleanTranscriptXML(subRes.data);
-              } catch (err) {
-                  console.log('[Warning] Nu s-a putut descărca transcriptul.');
-              }
-          }
-      }
-
-      // Trimitem răspunsul
-      res.json({
-          success: true,
-          videoId: videoId,
-          videoUrl: url,
-          title: data.title || 'YouTube Video',
-          thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
-          duration: data.lengthSeconds ? new Date(data.lengthSeconds * 1000).toISOString().substr(14, 5) : '',
-          formats: uniqueFormats,
-          transcript: transcriptText
-      });
-
-  } catch (error) {
-      console.error('[Eroare Server]:', error.message);
-      if (error.response && error.response.status === 429) {
-          return res.status(429).json({ success: false, error: 'Limita zilnică RapidAPI atinsă.' });
-      }
-      res.status(500).json({ success: false, error: 'Eroare procesare video.' });
-  }
-});
-
-// 4. ENDPOINT pentru generare link de download via API extern
-app.post('/api/generate-download', async (req, res) => {
-  const { videoUrl, quality } = req.body;
-
-  try {
-    // Folosim un API de conversie gratuit (ex: y2mate, loader.to, etc.)
-    // IMPORTANT: Acesta e un exemplu - trebuie să te înregistrezi pentru API key
-    
-    const conversionAPI = await axios.post('https://youtube-mp36.p.rapidapi.com/dl', {
-      id: extractVideoId(videoUrl)
-    }, {
+    // Folosim RapidAPI pentru info rapidă
+    const response = await axios.get('https://youtube-media-downloader.p.rapidapi.com/v2/video/details', {
+      params: { videoId: videoId },
       headers: {
         'x-rapidapi-key': '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3',
-        'x-rapidapi-host': 'youtube-mp36.p.rapidapi.com'
+        'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
       },
-      timeout: 15000
+      timeout: 12000
     });
 
-    if (conversionAPI.data && conversionAPI.data.link) {
-      res.json({
-        success: true,
-        downloadUrl: conversionAPI.data.link
-      });
-    } else {
-      throw new Error('Nu s-a putut genera link-ul de download');
+    const data = response.data;
+    if (!data || !data.videos) throw new Error('API-ul nu a returnat date.');
+
+    // Filtrare calități
+    const allVideos = data.videos.items;
+    let validFormats = allVideos
+      .filter(v => v.extension === 'mp4')
+      .map(v => {
+        const resMatch = v.quality?.match(/(\d+)p?/);
+        const resolution = resMatch ? parseInt(resMatch[1]) : 0;
+        return {
+          qualityLabel: v.quality || `${resolution}p`,
+          resolution: resolution
+        };
+      })
+      .filter(v => v.resolution > 0);
+
+    // Eliminăm duplicate
+    const uniqueFormats = [];
+    const seenResolutions = new Set();
+    for (const format of validFormats) {
+      if (!seenResolutions.has(format.resolution)) {
+        seenResolutions.add(format.resolution);
+        uniqueFormats.push(format);
+      }
+    }
+    uniqueFormats.sort((a, b) => b.resolution - a.resolution);
+
+    if (uniqueFormats.length === 0) throw new Error('Nu am găsit formate video valide.');
+
+    console.log(`[Success] ${uniqueFormats.length} rezoluții: ${uniqueFormats.map(f => f.qualityLabel).join(', ')}`);
+
+    // Transcript
+    let transcriptText = null;
+    if (data.subtitles && data.subtitles.items && data.subtitles.items.length > 0) {
+      const subs = data.subtitles.items;
+      const targetSub = subs.find(s => s.code === 'ro' || (s.name && s.name.toLowerCase().includes('romanian'))) ||
+        subs.find(s => s.code === 'en' || (s.name && s.name.toLowerCase().includes('english'))) ||
+        subs[0];
+
+      if (targetSub && targetSub.url) {
+        try {
+          const subRes = await axios.get(targetSub.url, { timeout: 5000 });
+          transcriptText = cleanTranscriptXML(subRes.data);
+        } catch (err) {
+          console.log('[Warning] Nu s-a putut descărca transcriptul.');
+        }
+      }
     }
 
-  } catch (error) {
-    console.error('[Conversion Error]:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Eroare la generarea link-ului de download' 
+    res.json({
+      success: true,
+      videoId: videoId,
+      videoUrl: url,
+      title: data.title || 'YouTube Video',
+      thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
+      duration: data.lengthSeconds ? new Date(data.lengthSeconds * 1000).toISOString().substr(14, 5) : '',
+      formats: uniqueFormats,
+      transcript: transcriptText
     });
+
+  } catch (error) {
+    console.error('[Eroare Server]:', error.message);
+    if (error.response && error.response.status === 429) {
+      return res.status(429).json({ success: false, error: 'Limita zilnică RapidAPI atinsă.' });
+    }
+    res.status(500).json({ success: false, error: 'Eroare procesare video.' });
   }
 });
 
-// 5. ALTERNATIVĂ: Download direct prin server (cu cache și optimizări)
+// 2. Download video folosind yt-dlp
 app.get('/api/download-video', async (req, res) => {
+  const { url, quality, title } = req.query;
+
+  if (!url) return res.status(400).send('URL lipsă');
+
+  const videoId = extractVideoId(url);
+  if (!videoId) return res.status(400).send('Link invalid');
+
+  const safeTitle = (title || 'video').replace(/[^a-z0-9\s\-_]/gi, '').trim().substring(0, 50) || 'video';
+  const fileName = `${videoId}_${quality || '720'}p_${Date.now()}.mp4`;
+  const filePath = path.join(TEMP_DIR, fileName);
+
+  console.log(`[Download Start] ${safeTitle} - ${quality}p`);
+
   try {
-    const videoUrl = req.query.url;
-    const title = req.query.title || 'video';
+    // Format string pentru yt-dlp
+    const qualityNum = parseInt(quality) || 720;
+    const format = `bestvideo[height<=${qualityNum}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${qualityNum}][ext=mp4]/best`;
 
-    if (!videoUrl) return res.status(400).send('URL lipsă');
+    // Comandă yt-dlp optimizată
+    const command = `yt-dlp -f "${format}" --merge-output-format mp4 --no-playlist --no-warnings --quiet -o "${filePath}" "${url}"`;
 
-    const safeTitle = title.replace(/[^a-z0-9\s\-_]/gi, '').trim().substring(0, 50) || 'video';
+    console.log('[Executing]', command);
 
-    // Headers optimizate pentru YouTube
-    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
-
-    // Streaming optimizat
-    const response = await axios({
-      method: 'GET',
-      url: videoUrl,
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'video',
-        'Sec-Fetch-Mode': 'no-cors',
-        'Sec-Fetch-Site': 'cross-site'
-      },
-      maxRedirects: 5,
-      timeout: 30000
+    // Timeout de 2 minute pentru download
+    const { stdout, stderr } = await execPromise(command, {
+      timeout: 120000,
+      maxBuffer: 50 * 1024 * 1024 // 50MB buffer
     });
 
-    // Forward content length if available
-    if (response.headers['content-length']) {
-      res.setHeader('Content-Length', response.headers['content-length']);
+    if (stderr && !stderr.includes('Deleting original file')) {
+      console.warn('[yt-dlp warning]:', stderr);
     }
 
-    response.data.pipe(res);
+    // Verificăm dacă fișierul există
+    if (!fs.existsSync(filePath)) {
+      throw new Error('Fișierul nu a fost descărcat.');
+    }
 
-    response.data.on('error', (err) => {
-      console.error('[Stream Error]:', err.message);
+    const stats = fs.statSync(filePath);
+    console.log(`[Download Complete] Size: ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
+
+    // Trimitem fișierul către client
+    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', stats.size);
+
+    const readStream = fs.createReadStream(filePath);
+    readStream.pipe(res);
+
+    readStream.on('end', () => {
+      // Ștergem fișierul după trimitere
+      setTimeout(() => {
+        fs.unlink(filePath, (err) => {
+          if (err) console.error('[Cleanup Error]:', err);
+          else console.log('[Cleanup] Fișier șters:', fileName);
+        });
+      }, 5000);
+    });
+
+    readStream.on('error', (err) => {
+      console.error('[Stream Error]:', err);
+      fs.unlink(filePath, () => {});
       if (!res.headersSent) {
         res.status(500).send('Eroare la transfer.');
       }
@@ -1498,8 +1518,38 @@ app.get('/api/download-video', async (req, res) => {
 
   } catch (error) {
     console.error('[Download Error]:', error.message);
+
+    // Cleanup în caz de eroare
+    if (fs.existsSync(filePath)) {
+      fs.unlink(filePath, () => {});
+    }
+
     if (!res.headersSent) {
-      res.status(500).send('Link expirat sau blocat de YouTube.');
+      if (error.killed) {
+        res.status(504).send('Timeout - videoclipul este prea mare.');
+      } else {
+        res.status(500).send('Eroare la descărcare video. Încearcă din nou.');
+      }
     }
   }
+});
+
+// 3. Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'online', message: 'Server funcțional!' });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`✅ Server pornit pe portul ${PORT}`);
+  console.log(`📁 Director temporar: ${TEMP_DIR}`);
+  
+  // Verificăm dacă yt-dlp este instalat
+  exec('yt-dlp --version', (error, stdout) => {
+    if (error) {
+      console.warn('⚠️  yt-dlp NU este instalat! Rulează: npm install -g yt-dlp');
+    } else {
+      console.log(`✅ yt-dlp versiunea: ${stdout.trim()}`);
+    }
+  });
 });

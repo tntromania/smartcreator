@@ -1,19 +1,22 @@
 {
-  "name": "smartcreator-chat",
-  "private": true,
-  "type": "commonjs",
+  "name": "smartcreator-backend",
+  "version": "1.0.0",
+  "description": "YouTube Downloader Backend",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "vapid-keys": "node -e \"const webpush=require('web-push');console.log(webpush.generateVAPIDKeys())\""
+    "dev": "nodemon server.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.3",
-    "axios": "^1.6.0",
+    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.0",
-    "express": "^4.19.2",
-    "stripe": "^16.0.0",
-    "ws": "^8.18.0",
-    "web-push": "^3.6.7"
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
