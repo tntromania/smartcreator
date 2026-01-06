@@ -1525,18 +1525,3 @@ app.get('/api/download-video', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'online', message: 'Server funcțional!' });
 });
-
-// Start server
-app.listen(PORT, () => {
-  console.log(`✅ Server pornit pe portul ${PORT}`);
-  console.log(`📁 Director temporar: ${TEMP_DIR}`);
-  
-  // Verificăm dacă yt-dlp este instalat
-  exec('yt-dlp --version', (error, stdout) => {
-    if (error) {
-      console.warn('⚠️  yt-dlp NU este instalat! Rulează: npm install -g yt-dlp');
-    } else {
-      console.log(`✅ yt-dlp versiunea: ${stdout.trim()}`);
-    }
-  });
-});
