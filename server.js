@@ -1,8 +1,5 @@
 // server.js
 require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
@@ -1293,6 +1290,7 @@ if (msg?.type === 'global-notification') {
    🔻 YOUTUBE DOWNLOADER - YT-DLP VERSION 🔻
    ========================================= */
 
+const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { exec } = require('child_process');
