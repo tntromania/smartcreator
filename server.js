@@ -1293,12 +1293,16 @@ if (msg?.type === 'global-notification') {
    🔻 YOUTUBE DOWNLOADER - YT-DLP VERSION 🔻
    ========================================= */
 
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 
 const execPromise = promisify(exec);
+const app = express();
 
 // Middleware
 app.use(cors());
