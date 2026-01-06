@@ -1290,43 +1290,16 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   SMART DOWNLOADER (RapidAPI: Video + Subs)
+   🔻 YOUTUBE DOWNLOADER PRO (NEW) 🔻
    ========================================= */
 
-// Helper pentru ID
+// 1. Helper ID
 function extractVideoId(url) {
     const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
     return match ? match[1] : null;
 }
 
-// Helper simplu pentru a curăța textul din XML (subtitrările vin des ca XML)
-function cleanTranscriptXML(xmlData) {
-    if (!xmlData) return '';
-    // Dacă e deja text simplu (nu are tag-uri <text>), returnăm direct
-    if (!xmlData.includes('<text')) return xmlData;
-    
-    // Eliminăm tag-urile XML și păstrăm doar conținutul
-    // Regex: Găsește tot ce e între > și <
-    return xmlData
-        .replace(/<[^>]*>/g, ' ')       // Șterge tag-urile
-        .replace(/\s+/g, ' ')           // Elimină spațiile multiple
-        .replace(/&amp;/g, '&')         // Fix caractere speciale
-        .replace(/&#39;/g, "'")
-        .replace(/&quot;/g, '"')
-        .trim();
-}
-
-/* =========================================
-   SMART DOWNLOADER (Listă Formate + Transcript)
-   ========================================= */
-
-// Helper pentru ID
-function extractVideoId(url) {
-    const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
-    return match ? match[1] : null;
-}
-
-// Helper curățare transcript
+// 2. Helper Transcript
 function cleanTranscriptXML(xmlData) {
     if (!xmlData) return '';
     if (!xmlData.includes('<text')) return xmlData;
@@ -1339,20 +1312,18 @@ function cleanTranscriptXML(xmlData) {
         .trim();
 }
 
+// 3. ENDPOINT PRINCIPAL: Obține Video + Toate Calitățile
 app.post('/api/yt-download', async (req, res) => {
   const { url } = req.body;
-  console.log('[SmartDownloader] URL:', url);
+  console.log('[SmartDownloader] Procesez URL:', url);
 
   if (!url) return res.status(400).json({ success: false, error: 'URL lipsă' });
 
   const videoId = extractVideoId(url);
   if (!videoId) return res.status(400).json({ success: false, error: 'Link invalid' });
 
-  const RAPID_API_KEY = '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3'; 
-
   try {
-      console.log(`[RapidAPI] Fetching details for ${videoId}...`);
-
+      // Cerere către RapidAPI
       const response = await axios.get('https://youtube-media-downloader.p.rapidapi.com/v2/video/details', {
         params: { videoId: videoId },
         headers: {
@@ -1364,26 +1335,36 @@ app.post('/api/yt-download', async (req, res) => {
       const data = response.data;
       if (!data || !data.videos) throw new Error('API-ul nu a returnat date.');
 
-      // --- LOGICĂ NOUĂ: Colectăm TOATE formatele bune ---
+      // --- FILTRARE CALITĂȚI ---
       const allVideos = data.videos.items;
       
-      // Filtrăm doar MP4 care AU sunet (hasAudio: true sau undefined)
-      // Eliminăm duplicatele de calitate (păstrăm doar una per rezoluție)
-      const validFormats = allVideos
+      // Colectăm formatele MP4 care au sunet
+      let validFormats = allVideos
           .filter(v => v.extension === 'mp4' && v.hasAudio !== false)
           .map(v => ({
-              quality: v.quality,
+              qualityLabel: v.quality, // ex: "1080p"
               url: v.url,
-              hasAudio: true,
-              size: v.sizeText || ''
+              size: v.sizeText || 'MP4'
           }));
 
-      // Dacă nu găsim nimic cu sunet, luăm tot ce e mp4 (fallback)
-      const finalFormats = validFormats.length > 0 ? validFormats : allVideos.filter(v => v.extension === 'mp4');
+      // Eliminăm duplicatele
+      validFormats = validFormats.filter((v, i, a) => a.findIndex(t => t.qualityLabel === v.qualityLabel) === i);
 
-      if (finalFormats.length === 0) throw new Error('Nu am găsit formate video valide.');
+      // Sortăm descrescător (1080p -> 720p -> 480p)
+      validFormats.sort((a, b) => parseInt(b.qualityLabel) - parseInt(a.qualityLabel));
 
-      // --- LOGICĂ TRANSCRIPT ---
+      // Fallback: dacă nu am găsit nimic cu sunet explicit, luăm tot ce e mp4
+      if (validFormats.length === 0) {
+          validFormats = allVideos.filter(v => v.extension === 'mp4').map(v => ({
+              qualityLabel: v.quality,
+              url: v.url,
+              size: v.sizeText || ''
+          }));
+      }
+
+      if (validFormats.length === 0) throw new Error('Nu am găsit formate video valide.');
+
+      // --- TRANSCRIPT ---
       let transcriptText = null;
       if (data.subtitles && data.subtitles.items) {
           const subs = data.subtitles.items;
@@ -1399,18 +1380,56 @@ app.post('/api/yt-download', async (req, res) => {
           }
       }
 
-      console.log(`[Success] Găsite ${finalFormats.length} formate. Transcript: ${transcriptText ? 'DA' : 'NU'}`);
+      console.log(`[Success] Trimitem ${validFormats.length} opțiuni.`);
 
+      // Trimitem răspunsul corect către Frontend
       res.json({
           success: true,
           title: data.title || 'YouTube Video',
           thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
-          formats: finalFormats, // Trimitem LISTA de formate, nu doar unul
+          duration: data.lengthSeconds ? new Date(data.lengthSeconds * 1000).toISOString().substr(14, 5) : '',
+          formats: validFormats, // LISTA DE FORMATE PENTRU DROPDOWN
           transcript: transcriptText
       });
 
   } catch (error) {
       console.error('[Eroare Server]:', error.message);
+      if (error.response && error.response.status === 429) {
+          return res.status(429).json({ success: false, error: 'Limita zilnică RapidAPI atinsă.' });
+      }
       res.status(500).json({ success: false, error: 'Eroare procesare video.' });
   }
+});
+
+// 4. ENDPOINT STREAMING (Pentru download direct, fără redirect)
+app.get('/api/stream-download', async (req, res) => {
+  try {
+    const videoUrl = req.query.url;
+    const title = req.query.title || 'video';
+
+    if (!videoUrl) return res.status(400).send('Lipsă URL');
+
+    const safeTitle = title.replace(/[^a-z0-9\s\-_]/gi, '').trim().substring(0, 50) || 'video';
+
+    // Setăm headerele care obligă browserul să descarce
+    res.header('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
+    res.header('Content-Type', 'video/mp4');
+
+    const response = await axios({
+      method: 'get',
+      url: videoUrl,
+      responseType: 'stream'
+    });
+
+    response.data.pipe(res);
+
+  } catch (error) {
+    console.error('[Stream Error]', error.message);
+    res.status(500).send('Eroare la descărcare stream.');
+  }
+});
+
+/* ========= START SERVER ========= */
+const server = app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
