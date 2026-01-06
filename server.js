@@ -8,6 +8,12 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const webpush = require('web-push');
 const Stripe = require('stripe');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs');
+const path = require('path');
+
+const execPromise = promisify(exec);
 
 /* ========= ENV ========= */
 const PORT                 = process.env.PORT || 10000;
