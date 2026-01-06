@@ -1428,8 +1428,3 @@ app.get('/api/stream-download', async (req, res) => {
     res.status(500).send('Eroare la descărcare stream.');
   }
 });
-
-/* ========= START SERVER ========= */
-const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
