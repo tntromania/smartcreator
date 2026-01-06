@@ -1290,7 +1290,7 @@ if (msg?.type === 'global-notification') {
 });
 
 /* =========================================
-   🔻 YOUTUBE DOWNLOADER PRO (OPTIMIZED) 🔻
+   🔻 YOUTUBE DOWNLOADER PRO (FINAL FIX) 🔻
    ========================================= */
 
 // 1. Helper ID
@@ -1312,7 +1312,7 @@ function cleanTranscriptXML(xmlData) {
         .trim();
 }
 
-// 3. ENDPOINT PRINCIPAL - OPTIMIZAT (fără transcript în primul request)
+// 3. ENDPOINT PRINCIPAL - CU TRANSCRIPT INCLUS
 app.post('/api/yt-download', async (req, res) => {
   const { url } = req.body;
   console.log('[SmartDownloader] Procesez URL:', url);
@@ -1323,14 +1323,14 @@ app.post('/api/yt-download', async (req, res) => {
   if (!videoId) return res.status(400).json({ success: false, error: 'Link invalid' });
 
   try {
-      // Cerere către RapidAPI - RAPIDĂ
+      // Cerere către RapidAPI
       const response = await axios.get('https://youtube-media-downloader.p.rapidapi.com/v2/video/details', {
         params: { videoId: videoId },
         headers: {
           'x-rapidapi-key': '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3',
           'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
         },
-        timeout: 10000 // 10 secunde
+        timeout: 12000
       });
 
       const data = response.data;
@@ -1371,7 +1371,25 @@ app.post('/api/yt-download', async (req, res) => {
 
       console.log(`[Success] ${uniqueFormats.length} rezoluții: ${uniqueFormats.map(f => f.qualityLabel).join(', ')}`);
 
-      // Trimitem IMEDIAT răspunsul (fără transcript)
+      // --- TRANSCRIPT (încărcare paralelă) ---
+      let transcriptText = null;
+      if (data.subtitles && data.subtitles.items && data.subtitles.items.length > 0) {
+          const subs = data.subtitles.items;
+          const targetSub = subs.find(s => s.code === 'ro' || (s.name && s.name.toLowerCase().includes('romanian'))) || 
+                            subs.find(s => s.code === 'en' || (s.name && s.name.toLowerCase().includes('english'))) || 
+                            subs[0];
+
+          if (targetSub && targetSub.url) {
+              try {
+                  const subRes = await axios.get(targetSub.url, { timeout: 5000 });
+                  transcriptText = cleanTranscriptXML(subRes.data);
+              } catch (err) {
+                  console.log('[Warning] Nu s-a putut descărca transcriptul.');
+              }
+          }
+      }
+
+      // Trimitem răspunsul complet
       res.json({
           success: true,
           videoId: videoId,
@@ -1379,7 +1397,7 @@ app.post('/api/yt-download', async (req, res) => {
           thumbnail: data.thumbnails ? data.thumbnails[data.thumbnails.length - 1].url : '',
           duration: data.lengthSeconds ? new Date(data.lengthSeconds * 1000).toISOString().substr(14, 5) : '',
           formats: uniqueFormats,
-          hasSubtitles: !!(data.subtitles && data.subtitles.items && data.subtitles.items.length > 0)
+          transcript: transcriptText
       });
 
   } catch (error) {
@@ -1388,91 +1406,5 @@ app.post('/api/yt-download', async (req, res) => {
           return res.status(429).json({ success: false, error: 'Limita zilnică RapidAPI atinsă.' });
       }
       res.status(500).json({ success: false, error: 'Eroare procesare video.' });
-  }
-});
-
-// 4. ENDPOINT SEPARAT PENTRU TRANSCRIPT (încărcare lazy)
-app.get('/api/yt-transcript/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-
-  try {
-    const response = await axios.get('https://youtube-media-downloader.p.rapidapi.com/v2/video/details', {
-      params: { videoId },
-      headers: {
-        'x-rapidapi-key': '7efb2ec2c9msh9064cf9c42d6232p172418jsn9da8ae5664d3',
-        'x-rapidapi-host': 'youtube-media-downloader.p.rapidapi.com'
-      },
-      timeout: 8000
-    });
-
-    const data = response.data;
-    let transcriptText = null;
-
-    if (data.subtitles && data.subtitles.items && data.subtitles.items.length > 0) {
-        const subs = data.subtitles.items;
-        const targetSub = subs.find(s => s.code === 'ro' || (s.name && s.name.toLowerCase().includes('romanian'))) || 
-                          subs.find(s => s.code === 'en' || (s.name && s.name.toLowerCase().includes('english'))) || 
-                          subs[0];
-
-        if (targetSub && targetSub.url) {
-            try {
-                const subRes = await axios.get(targetSub.url, { timeout: 5000 });
-                transcriptText = cleanTranscriptXML(subRes.data);
-            } catch (err) {
-                console.log('[Warning] Nu s-a putut descărca transcriptul.');
-            }
-        }
-    }
-
-    res.json({ success: true, transcript: transcriptText });
-
-  } catch (error) {
-    console.error('[Transcript Error]:', error.message);
-    res.status(500).json({ success: false, error: 'Eroare la încărcarea transcriptului.' });
-  }
-});
-
-// 5. ENDPOINT PROXY STREAMING (pentru download direct)
-app.get('/api/download-proxy', async (req, res) => {
-  try {
-    const videoUrl = req.query.url;
-    const title = req.query.title || 'video';
-
-    if (!videoUrl) return res.status(400).send('Lipsă URL');
-
-    const safeTitle = title.replace(/[^a-z0-9\s\-_]/gi, '').trim().substring(0, 50) || 'video';
-
-    // Headers pentru forțare download
-    res.header('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
-    res.header('Content-Type', 'video/mp4');
-    res.header('Cache-Control', 'no-cache');
-
-    // Streaming de la YouTube
-    const response = await axios({
-      method: 'get',
-      url: videoUrl,
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': '*/*',
-        'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com'
-      }
-    });
-
-    response.data.pipe(res);
-
-    response.data.on('error', (err) => {
-      console.error('[Stream Error]', err.message);
-      if (!res.headersSent) {
-        res.status(500).send('Eroare la streaming.');
-      }
-    });
-
-  } catch (error) {
-    console.error('[Proxy Error]', error.message);
-    if (!res.headersSent) {
-      res.status(500).send('Link expirat sau eroare.');
-    }
   }
 });
